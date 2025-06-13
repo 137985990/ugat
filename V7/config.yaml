@@ -1,0 +1,120 @@
+data_dir: Data
+data_files:
+  - ../Data/FM_original.csv
+  - ../Data/OD_original.csv
+  - ../Data/MEFAR_original.csv
+block_col: block
+## 指定本次训练/推理用的模态（FM、OD、MEFAR三者的去重并集，顺序可自定义）
+common_modalities:
+  - acc_x
+  - acc_y
+  - acc_z
+  - ppg
+  - gsr
+  - hr
+  - skt
+dataset_modalities:
+  FM:
+    have:
+      - alpha_tp9
+      - alpha_af7
+      - alpha_af8
+      - alpha_tp10
+      - beta_tp9
+      - beta_af7
+      - beta_af8
+      - beta_tp10
+      - delta_tp9
+      - delta_af7
+      - delta_af8
+      - delta_tp10
+      - gamma_tp9
+      - gamma_af7
+      - gamma_af8
+      - gamma_tp10
+      - theta_tp9
+      - theta_af7
+      - theta_af8
+      - theta_tp10
+      - ecg
+      - breathing
+    need:
+      - space_distance
+      - distance_to_eye_center
+      - pose_pca
+  OD:
+    have:
+      - space_distance
+      - distance_to_eye_center
+      - pose_pca
+    need:
+      - alpha_tp9
+      - alpha_af7
+      - alpha_af8
+      - alpha_tp10
+      - beta_tp9
+      - beta_af7
+      - beta_af8
+      - beta_tp10
+      - delta_tp9
+      - delta_af7
+      - delta_af8
+      - delta_tp10
+      - gamma_tp9
+      - gamma_af7
+      - gamma_af8
+      - gamma_tp10
+      - theta_tp9
+      - theta_af7
+      - theta_af8
+      - theta_tp10
+      - ecg
+      - breathing
+  MEFAR:
+    have: []
+    need:
+      - alpha_tp9
+      - alpha_af7
+      - alpha_af8
+      - alpha_tp10
+      - beta_tp9
+      - beta_af7
+      - beta_af8
+      - beta_tp10
+      - delta_tp9
+      - delta_af7
+      - delta_af8
+      - delta_tp10
+      - gamma_tp9
+      - gamma_af7
+      - gamma_af8
+      - gamma_tp10
+      - theta_tp9
+      - theta_af7
+      - theta_af8
+      - theta_tp10
+      - ecg
+      - breathing
+      - space_distance
+      - distance_to_eye_center
+      - pose_pca
+sample_rate: 32
+window_sec: 10.0
+step_sec: 3.0
+window_size: 320  # 32*10.0
+step_size: 96     # 32*3.0
+norm_method: zscore
+train_split: 0.6
+batch_size: 32
+epochs: 200
+lr: 0.0005
+patience: 20
+log_dir: Logs
+ckpt_dir: Checkpoints
+in_channels: 32  # 与modalities数量一致
+hidden_channels: 64
+out_channels: 32
+num_classes: 2
+# conv_channels: [64, 128, 256]  # 如有用可保留
+mode: train  # 可选: train 或 eval，train=训练，eval=只加载模型推理/补全
+model_path: Checkpoints/best_model.pth  # eval模式下加载的模型路径

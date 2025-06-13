@@ -1,0 +1,42 @@
+# config.yaml
+
+# 数据文件配置
+data_dir: Data
+data_files:
+  - ../Data/FM_original.csv
+  - ../Data/OD_original.csv
+  - ../Data/MEFAR_original.csv
+block_col: block
+feature_cols: [acc_x, acc_y, acc_z, ppg, gsr, hr, skt]
+sample_rate: 32
+window_sec: 10.0
+step_sec: 3.0
+window_size: 320  # 32*10.0
+step_size: 96     # 32*3.0
+norm_method: zscore
+train_split: 0.8
+batch_size: 32
+epochs: 200
+lr: 0.0005
+patience: 20
+log_dir: Logs
+ckpt_dir: Checkpoints
+conv_channels: [64, 128, 256]
+
+# 模型结构
+model:
+  hidden_channels: 64
+  encoder_layers: 3
+  decoder_layers: 3
+  heads: 4
+  trans_nhead: 4
+  trans_layers: 2
+  trans_dim_feedforward: 512
+  use_skip: true
+  shared_graph: true
+  use_attention_feedback: true
+
+# GSL 配置
+gsl:
+  top_k: 3
+

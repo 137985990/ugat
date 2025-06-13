@@ -1,0 +1,10 @@
+*.csv
+*.pt
+*.rar
+Data/
+Logs/
+outputs/
+Checkpoints/
+__pycache__/
+.pytest_cache/
+.vscode/
