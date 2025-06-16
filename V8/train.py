@@ -90,13 +90,73 @@ from torch.utils.data import DataLoader, random_split
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn import MSELoss
+from torch.utils.tensorboard.writer import SummaryWriter
+from torch.cuda.amp.autocast_mode import autocast
+from torch.cuda.amp.grad_scaler import GradScaler
+from torch.nn.utils.clip_grad import clip_grad_norm_
 
-from torch.utils.tensorboard import SummaryWriter
-
-from data import create_dataset_from_config
+from data import create_dataset_from_config, SlidingWindowDataset
 from model import TGATUNet
 
-
+class MultiDatasetSlidingWindow(SlidingWindowDataset):
+    def __init__(self, *args, need_indices_list=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.need_indices_list = need_indices_list
+    def __getitem__(self, idx):
+        b_idx, start, seg_label = self.indices[idx]
+        block = self.blocks[b_idx]
+        window_df = block.iloc[start:start + self.window_size]
+        # 自动填充缺失值
+        window_df = window_df.fillna(0)
+        data_array = window_df[self.feature_cols].values[::self.sampling_rate]
+        # 断言原始数据无 NaN/Inf
+        assert not (np.isnan(data_array).any() or np.isinf(data_array).any()), f"[断言失败] 原始data_array存在NaN/Inf! idx={idx}"
+        # Normalize
+        if self.normalize == 'zscore':
+            mean = data_array.mean(axis=0, keepdims=True)
+            std = data_array.std(axis=0, keepdims=True)
+            data_array = (data_array - mean) / (std + 1e-6)
+        elif self.normalize == 'minmax':
+            min_v = data_array.min(axis=0, keepdims=True)
+            max_v = data_array.max(axis=0, keepdims=True)
+            data_array = (data_array - min_v) / (max_v - min_v + 1e-6)
+        # 断言归一化后无 NaN/Inf
+        assert not (np.isnan(data_array).any() or np.isinf(data_array).any()), f"[断言失败] 归一化后data_array存在NaN/Inf! idx={idx}"
+        tensor = torch.from_numpy(data_array.T).float()  # [C, T]
+        label = int(seg_label)
+        label = torch.as_tensor(label, dtype=torch.long)
+        # 通道可信mask
+        is_real_mask = torch.tensor(self.get_is_real_mask(), dtype=torch.bool)
+        # 分阶段遮掩/补全逻辑
+        idx_in_data = block.index[start]
+        if idx_in_data >= len(self.need_indices_list) or idx_in_data < 0:
+            need_indices = []
+        else:
+            need_indices = self.need_indices_list[idx_in_data]
+        if need_indices is None:
+            need_indices = []
+        if self.phase == "encode":
+            if len(need_indices) == 0:
+                mask_idx = -1
+                tensor_masked = tensor
+            else:
+                mask_idx = np.random.choice(need_indices)
+                tensor_masked = tensor.clone()
+                tensor_masked[mask_idx, :] = 0
+            return tensor_masked, label, mask_idx, is_real_mask
+        elif self.phase == "decode":
+            if self.dynamic_need and len(need_indices) > 0:
+                need_idx = np.random.choice(need_indices)
+            elif len(need_indices) > 0:
+                need_idx = need_indices[0]
+            else:
+                need_idx = -1
+            tensor_masked = tensor.clone()
+            if need_idx != -1:
+                tensor_masked[need_idx, :] = 0
+            return tensor_masked, label, need_idx, is_real_mask
+        else:
+            return tensor, label, -1, is_real_mask
 def complete_dataset_to_csv(model, dataset, mask_indices, device, save_path, dataset_modalities):
     """
     用模型对数据集进行模态补全，保存补全后的数据为CSV
@@ -234,7 +294,7 @@ def mask_channel(x, mask_indices, mask_ratio=0.2):
 def train_phased(
     model, dataloader, optimizer, criterion, device,
     mask_indices, phase="encode", classifier=None, gen_optimizer=None, disc_optimizer=None,
-    dynamic_need_indices=None
+    dynamic_need_indices=None, scaler=None
 ):
     """
     phase: "train"
@@ -248,62 +308,56 @@ def train_phased(
     total_correct = 0
     total_samples = 0
     for batch, labels, mask_idx, is_real_mask in tqdm(dataloader, desc=phase.capitalize()):
-        batch = batch.to(device)
-        labels = labels.to(device)
-        is_real_mask = is_real_mask.to(device)
+        batch = batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        is_real_mask = is_real_mask.to(device, non_blocking=True)
         masked, mask_idx = mask_channel(batch, mask_indices)
         batch_size, C, T = batch.size()
-        # === Debug: 检查输入是否有 NaN/Inf ===
-        if torch.isnan(batch).any() or torch.isinf(batch).any():
-            print("[DEBUG] Input batch contains NaN or Inf!")
-        if torch.isnan(masked).any() or torch.isinf(masked).any():
-            print("[DEBUG] Masked input contains NaN or Inf!")
         loss = 0.0
         cls_loss = 0.0
         recon_loss = 0.0
         optimizer.zero_grad()
         for i in range(batch_size):
             window = masked[i].t()  # [T, C]
-            out, logits = model(window)  # out: [C, T], logits: [num_classes]
-            # === Debug: 检查模型输出是否有 NaN/Inf ===
-            if torch.isnan(out).any() or torch.isinf(out).any():
-                print(f"[DEBUG] Model output contains NaN or Inf at sample {i}!")
-            # 只对真实通道计算重建损失
-            if is_real_mask.dim() == 2:
-                real_channels = is_real_mask[i]
-            else:
-                real_channels = is_real_mask
-            recon_loss_i = 0.0
-            real_count = 0
-            for c in range(C):
-                if real_channels[c]:
-                    target = batch[i, c, :]
-                    pred = out[c, :]
-                    recon_loss_i = recon_loss_i + criterion(pred, target)
-                    real_count += 1
-            if real_count > 0:
-                recon_loss_i = recon_loss_i / real_count
-            cls_loss_i = ce_loss(logits.unsqueeze(0), labels[i].unsqueeze(0))
-            loss += recon_loss_i + cls_loss_i
-            recon_loss += recon_loss_i
-            cls_loss += cls_loss_i
-            pred_class = logits.argmax(-1).item()
-            if pred_class == labels[i].item():
-                total_correct += 1
-            total_samples += 1
+            with autocast(enabled=(scaler is not None)):
+                out, logits = model(window)
+                # === Debug: 检查模型输出是否有 NaN/Inf ===
+                if torch.isnan(out).any() or torch.isinf(out).any():
+                    print(f"[DEBUG] Model output contains NaN or Inf at sample {i}!")
+                # 只对真实通道计算重建损失
+                if is_real_mask.dim() == 2:
+                    real_channels = is_real_mask[i]
+                else:
+                    real_channels = is_real_mask
+                recon_loss_i = 0.0
+                real_count = 0
+                for c in range(C):
+                    if real_channels[c]:
+                        target = batch[i, c, :]
+                        pred = out[c, :]
+                        recon_loss_i = recon_loss_i + criterion(pred, target)
+                        real_count += 1
+                if real_count > 0:
+                    recon_loss_i = recon_loss_i / real_count
+                cls_loss_i = ce_loss(logits.unsqueeze(0), labels[i].unsqueeze(0))
+                loss = loss + recon_loss_i + cls_loss_i
+                recon_loss = recon_loss + recon_loss_i
+                cls_loss = cls_loss + cls_loss_i
+                pred_class = logits.argmax(-1).item()
+                if pred_class == labels[i].item():
+                    total_correct += 1
+                total_samples += 1
         loss = loss / batch_size
-        # === Debug: 检查 loss 是否有 NaN/Inf ===
-        # 避免重复包裹 tensor，直接用 float/torch API 检查
-        if isinstance(loss, torch.Tensor):
-            if torch.isnan(loss).any() or torch.isinf(loss).any():
-                print("[DEBUG] Loss is NaN or Inf after batch!")
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            import math
-            if math.isnan(loss) or math.isinf(loss):
-                print("[DEBUG] Loss is NaN or Inf after batch!")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            loss.backward()
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         total_loss += loss.item() * batch_size
         total_recon_loss += recon_loss
         total_cls_loss += cls_loss
@@ -361,7 +415,7 @@ def main():
         config = yaml.safe_load(f)
 
     # 参数
-    batch_size = config.get('batch_size', 32)
+    batch_size = config.get('batch_size', 64)  # 默认64
     epochs = config.get('epochs', 100)
     lr = config.get('lr', 1e-3)
     early_stop_patience = config.get('patience', 10)
@@ -442,65 +496,7 @@ def main():
             need_indices = []
         need_indices_list.append(need_indices)
     # SlidingWindowDataset expects a DataFrame and global need_indices, so we subclass to support per-sample need_indices
-    class MultiDatasetSlidingWindow(SlidingWindowDataset):
-        def __init__(self, *args, need_indices_list=None, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.need_indices_list = need_indices_list
-        def __getitem__(self, idx):
-            b_idx, start, seg_label = self.indices[idx]
-            block = self.blocks[b_idx]
-            window_df = block.iloc[start:start + self.window_size]
-            # 自动填充缺失值
-            window_df = window_df.fillna(0)
-            data_array = window_df[self.feature_cols].values[::self.sampling_rate]
-            # 断言原始数据无 NaN/Inf
-            assert not (np.isnan(data_array).any() or np.isinf(data_array).any()), f"[断言失败] 原始data_array存在NaN/Inf! idx={idx}"
-            # Normalize
-            if self.normalize == 'zscore':
-                mean = data_array.mean(axis=0, keepdims=True)
-                std = data_array.std(axis=0, keepdims=True)
-                data_array = (data_array - mean) / (std + 1e-6)
-            elif self.normalize == 'minmax':
-                min_v = data_array.min(axis=0, keepdims=True)
-                max_v = data_array.max(axis=0, keepdims=True)
-                data_array = (data_array - min_v) / (max_v - min_v + 1e-6)
-            # 断言归一化后无 NaN/Inf
-            assert not (np.isnan(data_array).any() or np.isinf(data_array).any()), f"[断言失败] 归一化后data_array存在NaN/Inf! idx={idx}"
-            tensor = torch.from_numpy(data_array.T).float()  # [C, T]
-            label = int(seg_label)
-            label = torch.as_tensor(label, dtype=torch.long)
-            # 通道可信mask
-            is_real_mask = torch.tensor(self.get_is_real_mask(), dtype=torch.bool)
-            # 分阶段遮掩/补全逻辑
-            idx_in_data = block.index[start]
-            if idx_in_data >= len(self.need_indices_list) or idx_in_data < 0:
-                need_indices = []
-            else:
-                need_indices = self.need_indices_list[idx_in_data]
-            if need_indices is None:
-                need_indices = []
-            if self.phase == "encode":
-                if len(need_indices) == 0:
-                    mask_idx = -1
-                    tensor_masked = tensor
-                else:
-                    mask_idx = np.random.choice(need_indices)
-                    tensor_masked = tensor.clone()
-                    tensor_masked[mask_idx, :] = 0
-                return tensor_masked, label, mask_idx, is_real_mask
-            elif self.phase == "decode":
-                if self.dynamic_need and len(need_indices) > 0:
-                    need_idx = np.random.choice(need_indices)
-                elif len(need_indices) > 0:
-                    need_idx = need_indices[0]
-                else:
-                    need_idx = -1
-                tensor_masked = tensor.clone()
-                if need_idx != -1:
-                    tensor_masked[need_idx, :] = 0
-                return tensor_masked, label, need_idx, is_real_mask
-            else:
-                return tensor, label, -1, is_real_mask
+    # 已移至全局作用域，无需在此定义
 
     dataset = MultiDatasetSlidingWindow(
         data=data,
@@ -536,9 +532,9 @@ def main():
     assert train_len + val_len + test_len == total
     print(f"[数据集分配] (多数据集融合) 总数: {total}, 训练: {train_len}, 验证: {val_len}, 测试: {test_len}")
     train_ds, val_ds, test_ds = random_split(dataset, [train_len, val_len, test_len])
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
-    test_loader = DataLoader(test_ds, batch_size=batch_size)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, num_workers=4, pin_memory=True)
 
     # 输出训练集标签分布
     check_label_distribution(train_ds)
@@ -577,13 +573,14 @@ def main():
     writer = SummaryWriter(log_dir=log_dir_full)
 
     # ========== 单阶段端到端训练主循环 ========== 
+    scaler = GradScaler() if torch.cuda.is_available() else None
     if mode == 'train':
         for epoch in range(1, epochs + 1):
             train_loss, train_recon, train_cls, train_acc = train_phased(
-                model, train_loader, optimizer, criterion, device, mask_indices
+                model, train_loader, optimizer, criterion, device, mask_indices, scaler=scaler
             )
             val_loss, val_recon, _, _ = train_phased(
-                model, val_loader, optimizer, criterion, device, mask_indices
+                model, val_loader, optimizer, criterion, device, mask_indices, scaler=scaler
             )
             scheduler.step(val_loss)
             # 获取当前学习率
@@ -647,5 +644,7 @@ def main():
     writer.close()
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
     main()
 

@@ -8,6 +8,7 @@ import logging
 from datetime import datetime
 
 import torch
+torch.manual_seed(42)
 from tqdm import tqdm
 from torch.utils.data import DataLoader, random_split
 from torch.optim import Adam

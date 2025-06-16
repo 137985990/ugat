@@ -103,12 +103,23 @@ class SlidingWindowDataset(Dataset):
         # Prepare blocks
         self.blocks = [df for _, df in self.data.groupby(self.block_col)]
 
-        # Precompute window start indices for each block
+        # 新增：只在标签连续区间内滑窗
         self.indices = []  # List of tuples (block_idx, start_idx)
         for b_idx, block in enumerate(self.blocks):
-            length = len(block)
-            for start in range(0, length - window_size + 1, step_size):
-                self.indices.append((b_idx, start))
+            labels = block[self.label_col].values
+            # 兼容1/2和0/1标签
+            if np.all(np.isin(labels, [1, 2])):
+                labels = labels - 1
+            # 找到标签变化点
+            change_points = np.where(np.diff(labels) != 0)[0] + 1
+            seg_starts = np.concatenate(([0], change_points))
+            seg_ends = np.concatenate((change_points, [len(labels)]))
+            for seg_start, seg_end in zip(seg_starts, seg_ends):
+                seg_len = seg_end - seg_start
+                if seg_len < self.window_size:
+                    continue  # 区间太短，跳过
+                for start in range(seg_start, seg_end - self.window_size + 1, self.step_size):
+                    self.indices.append((b_idx, start))
 
     def __len__(self):
         return len(self.indices)
@@ -131,12 +142,13 @@ class SlidingWindowDataset(Dataset):
 
         tensor = torch.from_numpy(data_array.T).float()  # [C, T]
 
-        # Get label: use the last row's F value (assume binary 0/1 or 1/2)
-        label_val = window_df[self.label_col].values[-1]
-        if label_val in [1, 2]:
-            label = int(label_val) - 1
+        # Get label: use 1 if any F in window is 1/2, else 0 (兼容1/2和0/1标签)
+        f_vals = window_df[self.label_col].values
+        # 兼容1/2和0/1标签
+        if np.any(np.isin(f_vals, [1, 2])):
+            label = 1
         else:
-            label = int(label_val)
+            label = 0
         label = torch.tensor(label, dtype=torch.long)
 
         # 通道可信mask
@@ -222,6 +234,8 @@ def create_dataset_from_config(cfg_path: str, phase: str = "encode", need_indice
     if dups:
         print('重复项:', dups)
     all_modalities = list(dict.fromkeys(modalities_raw))
+    # 保证所有modalities、label_col、block_col都小写
+    all_modalities = [m.lower() for m in modalities_raw]
     block_col = cfg['block_col'].strip().lower()
     label_col = cfg.get('label_col', 'F').strip().lower()
     for col in all_modalities:
