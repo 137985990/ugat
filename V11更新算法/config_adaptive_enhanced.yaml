@@ -1,0 +1,6 @@
+loss_config:
+  cls_weight: 1.0
+  l1_weight: 0.1
+  recon_weight: 1.0
+  smooth_weight: 0.05
+  type: enhanced_adaptive

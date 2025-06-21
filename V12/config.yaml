@@ -1,0 +1,186 @@
+data_dir: Data
+data_files:
+  - ../Data/FM_original.csv
+  - ../Data/OD_original.csv
+  - ../Data/MEFAR_original.csv
+block_col: block
+label_col: F  # 修正为大写F
+## 指定本次训练/推理用的模态（FM、OD、MEFAR三者的去重并集，顺序可自定义）
+common_modalities:
+  - acc_x
+  - acc_y
+  - acc_z
+  - ppg
+  - gsr
+  - hr
+  - skt
+dataset_modalities:
+  FM:
+    have:
+      - alpha_tp9
+      - alpha_af7
+      - alpha_af8
+      - alpha_tp10
+      - beta_tp9
+      - beta_af7
+      - beta_af8
+      - beta_tp10
+      - delta_tp9
+      - delta_af7
+      - delta_af8
+      - delta_tp10
+      - gamma_tp9
+      - gamma_af7
+      - gamma_af8
+      - gamma_tp10
+      - theta_tp9
+      - theta_af7
+      - theta_af8
+      - theta_tp10
+      - ecg
+      - breathing
+    need:
+      - space_distance
+      - distance_to_eye_center
+      - pose_pca
+  OD:
+    have:
+      - space_distance
+      - distance_to_eye_center
+      - pose_pca
+    need:
+      - alpha_tp9
+      - alpha_af7
+      - alpha_af8
+      - alpha_tp10
+      - beta_tp9
+      - beta_af7
+      - beta_af8
+      - beta_tp10
+      - delta_tp9
+      - delta_af7
+      - delta_af8
+      - delta_tp10
+      - gamma_tp9
+      - gamma_af7
+      - gamma_af8
+      - gamma_tp10
+      - theta_tp9
+      - theta_af7
+      - theta_af8
+      - theta_tp10
+      - ecg
+      - breathing
+  MEFAR:
+    have: []
+    need:
+      - alpha_tp9
+      - alpha_af7
+      - alpha_af8
+      - alpha_tp10
+      - beta_tp9
+      - beta_af7
+      - beta_af8
+      - beta_tp10
+      - delta_tp9
+      - delta_af7
+      - delta_af8
+      - delta_tp10
+      - gamma_tp9
+      - gamma_af7
+      - gamma_af8
+      - gamma_tp10
+      - theta_tp9
+      - theta_af7
+      - theta_af8
+      - theta_tp10
+      - ecg
+      - breathing
+      - space_distance
+      - distance_to_eye_center
+      - pose_pca
+sample_rate: 32
+window_sec: 10.0
+step_sec: 3.0
+window_size: 320  # 32*10.0
+step_size: 96     # 32*3.0
+norm_method: zscore
+train_split: 0.6
+# 针对32GB内存+16GB显存的配置（最大化显存利用）
+batch_size: 128                  # 大幅增加batch size，充分利用16GB显存
+epochs: 200
+lr: 0.003                        # 相应调整学习率
+patience: 30
+accumulate_grad_batches: 1       # 减少梯度累积，直接使用大batch
+
+# 高性能优化配置 - 最大化显存利用版本
+use_optimized_model: true        
+use_memory_optimizer: true       
+use_gradient_checkpoint: true    # 梯度检查点节省显存
+use_mixed_precision: true        # 混合精度训练节省显存
+gradient_checkpointing: true     
+num_workers: 0                   # Windows兼容
+pin_memory: true                 
+prefetch_factor: 8               # 增加预取因子
+persistent_workers: false        
+
+# 显存最大化调优
+torch_compile: true              
+dataloader_drop_last: true       
+enable_fast_data_loading: false   # 暂时禁用，使用标准数据加载器
+max_gpu_memory_fraction: 0.95    # 使用95%的显存
+
+# 高级功能配置
+use_unet_architecture: false    # 使用真正的U-Net架构
+use_curriculum_learning: false  # 使用课程学习
+enable_attention_viz: false     # 启用注意力可视化
+
+# 课程学习配置
+curriculum_metric: "missing_ratio"  # 难度度量: missing_ratio, seq_length, noise_level
+curriculum_type: "linear"           # 课程类型: linear, exponential, step, adaptive
+
+encoder_layers: 2               # 减少编码器层数
+decoder_layers: 2               # 减少解码器层数
+transformer_layers: 1           # 减少Transformer层数
+attention_heads: 2              # 减少注意力头数
+time_k: 1                       # 时间邻接范围
+
+log_dir: Logs
+ckpt_dir: Checkpoints
+in_channels: 32  # 与配置中定义的特征数量一致
+hidden_channels: 64
+out_channels: 32
+num_classes: 2
+
+mode: train  # 可选: train 或 eval，train=训练，eval=只加载模型推理/补全
+model_path: Checkpoints/best_model.pth  # eval模式下加载的模型路径
+
+# 损失函数配置
+loss_config:
+  type: "multimodal"           # 损失函数类型: basic, multimodal
+  recon_weight: 1.0            # 重建损失权重
+  cls_weight: 1.0              # 分类损失权重
+  common_weight: 1.2           # common_modalities权重（稍高，因为是真实数据）
+  have_weight: 1.0             # have_modalities权重
+  l1_weight: 0.1               # L1正则化权重
+  adaptive: true               # 是否使用自适应权重调整
+  
+  # 详细损失监控
+  log_detailed_losses: true    # 是否记录详细损失信息
+  save_loss_curves: true       # 是否保存损失曲线图
+
+# 增强验证配置
+enhanced_validation:
+  enabled: true                # 启用增强验证策略
+  min_delta: 1e-6             # 最小改进阈值
+  val_freq_schedule:          # 验证频率调度
+    - epochs: [0, 10]
+      frequency: 1            # 前10个epoch每次都验证
+    - epochs: [10, 50]
+      frequency: 2            # 10-50epoch每2次验证一次
+    - epochs: [50, 999]
+      frequency: 5            # 50+epoch每5次验证一次
+  overfitting_threshold: 0.15 # 过拟合检测阈值
+  composite_weights:          # 综合评分权重
+    loss_weight: 0.6          # 损失权重
+    accuracy_weight: 0.4      # 准确率权重

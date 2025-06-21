@@ -1,0 +1,62 @@
+# 图表配置文件
+chart_config:
+  # 字体设置
+  fonts:
+    chinese:
+      - "Microsoft YaHei"  # Windows默认
+      - "PingFang SC"      # macOS默认  
+      - "Noto Sans CJK SC" # Linux推荐
+      - "SimHei"           # 黑体
+      - "SimSun"           # 宋体
+    fallback:
+      - "DejaVu Sans"
+      - "Arial"
+      - "Liberation Sans"
+  
+  # 图表样式
+  style:
+    figure_size: [12, 8]
+    dpi: 300
+    colors:
+      primary: "#FF6B6B"
+      secondary: "#4ECDC4" 
+      accent: "#45B7D1"
+      success: "#96CEB4"
+      warning: "#FFEAA7"
+    
+    line_width: 2.5
+    marker_size: 8
+    grid_alpha: 0.3
+    
+  # 输出设置
+  output:
+    formats: ["png", "pdf", "svg"]
+    save_dpi: 300
+    bbox_inches: "tight"
+    facecolor: "white"
+  
+  # 错误处理
+  fallback_mode: true
+  save_raw_data: true
+  
+# 文本配置
+text_config:
+  chinese:
+    graph_building: "图构建性能对比"
+    sequence_length: "序列长度" 
+    build_time: "构建时间 (秒)"
+    standard_building: "标准图构建"
+    cached_building: "缓存图构建"
+    speedup_ratio: "加速比"
+    cache_speedup: "缓存加速效果"
+    performance_test: "性能测试"
+    
+  english:
+    graph_building: "Graph Building Performance"
+    sequence_length: "Sequence Length"
+    build_time: "Build Time (seconds)" 
+    standard_building: "Standard Building"
+    cached_building: "Cached Building"
+    speedup_ratio: "Speedup Ratio"
+    cache_speedup: "Cache Speedup Effect"
+    performance_test: "Performance Test"

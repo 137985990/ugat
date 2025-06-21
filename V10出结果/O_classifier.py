@@ -34,6 +34,44 @@ class LSTMClassifier(torch.nn.Module):
         out = self.fc2(out)
         return out
 
+class GRUClassifier(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.3, bidirectional=True):
+        super(GRUClassifier, self).__init__()
+        self.gru = torch.nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.fc1 = torch.nn.Linear(hidden_size * (2 if bidirectional else 1), hidden_size)
+        self.relu = torch.nn.ReLU()
+        self.fc2 = torch.nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        out = out[:, -1, :]
+        out = self.dropout(out)
+        out = self.fc1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        return out
+
+class MLPClassifier(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.3):
+        super(MLPClassifier, self).__init__()
+        layers = []
+        in_dim = input_size
+        for _ in range(num_layers):
+            layers.append(torch.nn.Linear(in_dim, hidden_size))
+            layers.append(torch.nn.ReLU())
+            layers.append(torch.nn.Dropout(dropout))
+            in_dim = hidden_size
+        layers.append(torch.nn.Linear(hidden_size, num_classes))
+        self.mlp = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x: [batch, C, T] or [batch, T, C], flatten except batch
+        if x.dim() == 3:
+            x = x.reshape(x.size(0), -1)
+        return self.mlp(x)
+
 def main(config_path):
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -43,6 +81,7 @@ def main(config_path):
     hidden_size = config.get('hidden_size', 128)
     num_layers = config.get('num_layers', 2)
     num_classes = config.get('num_classes', 2)
+    model_type = config.get('model_type', 'lstm').lower()  # 新增模型类型
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 数据集读取和划分
@@ -116,7 +155,19 @@ def main(config_path):
     input_size = sample_x.shape[0] if sample_x.dim() == 2 else len(sample_x)
     seq_len = sample_x.shape[1] if sample_x.dim() == 2 else 1
 
-    model = LSTMClassifier(input_size, hidden_size, num_layers, num_classes).to(device)
+    # 根据模型类型选择模型
+    if model_type == 'lstm':
+        model = LSTMClassifier(input_size, hidden_size, num_layers, num_classes).to(device)
+        model_save_path = 'best_lstm_classifier.pth'
+    elif model_type == 'gru':
+        model = GRUClassifier(input_size, hidden_size, num_layers, num_classes).to(device)
+        model_save_path = 'best_gru_classifier.pth'
+    elif model_type == 'mlp':
+        model = MLPClassifier(input_size * seq_len, hidden_size, num_layers, num_classes).to(device)
+        model_save_path = 'best_mlp_classifier.pth'
+    else:
+        raise ValueError(f"不支持的模型类型: {model_type}")
+
     optimizer = Adam(model.parameters(), lr=lr)
     scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=5, verbose=True)
     # 计算类别权重，缓解不平衡
@@ -132,8 +183,9 @@ def main(config_path):
         model.train()
         total_loss = 0
         for x, y, _, _ in train_loader:
-            # x: [batch, C, T]，需要转为 [batch, T, C]
-            x = x.permute(0, 2, 1)
+            # x: [batch, C, T]，需要转为 [batch, T, C]（RNN类），MLP直接展平
+            if model_type in ['lstm', 'gru']:
+                x = x.permute(0, 2, 1)
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             outputs = model(x)
@@ -151,7 +203,8 @@ def main(config_path):
         val_preds = []
         with torch.no_grad():
             for x, y, _, _ in val_loader:
-                x = x.permute(0, 2, 1)
+                if model_type in ['lstm', 'gru']:
+                    x = x.permute(0, 2, 1)
                 x, y = x.to(device), y.to(device)
                 outputs = model(x)
                 _, predicted = torch.max(outputs, 1)
@@ -169,7 +222,7 @@ def main(config_path):
         scheduler.step(avg_loss)
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_lstm_classifier.pth')
+            torch.save(model.state_dict(), model_save_path)
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
@@ -179,7 +232,7 @@ def main(config_path):
     print("训练完成，最佳验证集准确率：", best_val_acc)
 
     # 测试集评估
-    model.load_state_dict(torch.load('best_lstm_classifier.pth'))
+    model.load_state_dict(torch.load(model_save_path))
     model.eval()
     correct = 0
     total = 0
@@ -187,7 +240,8 @@ def main(config_path):
     test_preds = []
     with torch.no_grad():
         for x, y, _, _ in test_loader:
-            x = x.permute(0, 2, 1)
+            if model_type in ['lstm', 'gru']:
+                x = x.permute(0, 2, 1)
             x, y = x.to(device), y.to(device)
             outputs = model(x)
             _, predicted = torch.max(outputs, 1)
@@ -203,9 +257,30 @@ def main(config_path):
         test_auc = 0.0
     print(f"测试集准确率: {test_acc:.4f}, F1: {test_f1:.4f}, AUC: {test_auc:.4f}")
 
+def run_all_models(config_path):
+    model_types = ['lstm', 'gru', 'mlp']
+    import yaml
+    for mtype in model_types:
+        print(f"\n===== 开始训练和评估模型: {mtype.upper()} =====")
+        # 读取配置，修改model_type
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        config['model_type'] = mtype
+        # 临时写入一个新的配置文件
+        tmp_config_path = f"tmp_{mtype}_config.yaml"
+        with open(tmp_config_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(config, f, allow_unicode=True)
+        main(tmp_config_path)
+        # 删除临时文件
+        os.remove(tmp_config_path)
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yaml', help='配置文件路径')
+    parser.add_argument('--all', action='store_true', help='一次性训练和评估所有模型')
     args = parser.parse_args()
-    main(args.config)
+    if args.all:
+        run_all_models(args.config)
+    else:
+        main(args.config)
