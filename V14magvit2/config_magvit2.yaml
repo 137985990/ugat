@@ -1,0 +1,99 @@
+# config_magvit2.yaml - Magvit2 VAE配置文件
+
+# 基本设置
+batch_size: 16
+epochs: 100
+lr: 1e-4
+patience: 15
+log_dir: 'Logs'
+ckpt_dir: 'Checkpoints'
+mode: 'train'  # 'train' or 'eval'
+
+# 数据设置
+data_dir: '../Data'
+data_files:
+  - 'FM_original.csv'
+  - 'OD_original.csv'
+  - 'MEFAR_original.csv'
+
+# 窗口设置
+window_size: 320
+step_size: 96
+train_split: 0.6
+
+# 数据加载设置
+num_workers: 0  # Windows兼容
+pin_memory: true
+prefetch_factor: 2
+persistent_workers: false
+dataloader_drop_last: true
+
+# Magvit2模型参数
+in_channels: 32
+hidden_channels: 128
+latent_dim: 64
+num_embeddings: 1024
+num_classes: 2
+commitment_cost: 0.25
+
+# 训练设置
+accumulate_grad_batches: 4
+use_mixed_precision: true
+
+# 损失函数配置
+loss_config:
+  type: 'multimodal'  # 使用多模态损失
+  recon_weight: 1.0
+  vq_weight: 1.0
+  cls_weight: 0.1
+  perceptual_weight: 0.05
+
+# 多模态配置
+common_modalities:
+  - 'acc_x'
+  - 'acc_y'
+  - 'acc_z'
+  - 'ppg'
+  - 'gsr'
+  - 'hr'
+  - 'skt'
+
+dataset_modalities:
+  FM:
+    have: ['alpha_TP9', 'alpha_AF7', 'alpha_AF8', 'alpha_TP10', 'beta_TP9', 'beta_AF7', 'beta_AF8', 'beta_TP10']
+    need: ['ecg', 'breathing']
+  OD:
+    have: ['space_distance', 'hdistance_to_eye_center', 'distance_to_eye_center', 'gaze_duration']
+    need: ['fatigue']
+  MEFAR:
+    have: ['Delta', 'Theta', 'Alpha1', 'Alpha2', 'Beta1', 'Beta2']
+    need: ['Attention', 'Meditation']
+
+# 验证策略
+enhanced_validation:
+  min_delta: 1e-6
+  composite_weights:
+    loss: 0.4
+    accuracy: 0.3
+    f1: 0.3
+
+# 优化设置
+norm_method: 'zscore'
+block_col: 'block'
+label_col: 'F'
+
+# 快速数据加载（可选）
+enable_fast_data_loading: false
+
+# 早停和调度器
+scheduler:
+  factor: 0.5
+  patience: 5
+  verbose: true
+
+# Magvit2特定设置
+magvit2:
+  num_res_blocks: 2
+  attention_levels: [2, 3]  # 在哪些层使用注意力
+  use_ema: false  # 是否使用指数移动平均
+  ema_decay: 0.999

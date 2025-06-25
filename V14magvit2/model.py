@@ -113,10 +113,6 @@ class TGATUNet(nn.Module):
                                                 dim_feedforward=trans_dim_feedforward)
         self.decoder = GraphDecoder(hidden_channels, out_channels,
                                     num_layers=decoder_layers, heads=heads)
-        
-        # UNet Skip Connection: 将编码器特征连接到解码器
-        self.skip_proj = nn.Linear(hidden_channels + hidden_channels, hidden_channels)
-        
         # 分类头：全局池化后MLP
         self.classifier = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels // 2),
@@ -131,13 +127,13 @@ class TGATUNet(nn.Module):
                 nn.Linear(out_channels, out_channels // 2),
                 nn.ReLU(),
                 nn.Linear(out_channels // 2, 1),
-                nn.Sigmoid()            )
+                nn.Sigmoid()
+            )
         else:
             self.discriminator = None
 
     def forward(self, window, return_attention=False, phase="encode"):
         """
-        UNet范式前向传播，单阶段encode/decode为同一前向过程
         phase: "encode" or "decode"
         - encode: 返回 (out, logits)
         - decode: 返回 (out, disc_pred)
@@ -146,34 +142,25 @@ class TGATUNet(nn.Module):
         data = build_graph(window, time_k=self.time_k)
         x = data.x.to(device) if data.x is not None else None
         edge_index = data.edge_index.to(device) if data.edge_index is not None else None
-        
-        # UNet Encode: GAT下采样
+        # Encode
         if return_attention:
-            h_encoded, encoder_attn = self.encoder(x, edge_index, return_attention=True)  # [T, hidden], list
+            h, encoder_attn = self.encoder(x, edge_index, return_attention=True)  # [T, hidden], list
         else:
-            h_encoded = self.encoder(x, edge_index)
-        
-        # UNet Bottleneck: Transformer瓶颈
-        h_trans = h_encoded.unsqueeze(0)  # [1, T, hidden]
-        h_bottleneck = self.bottleneck(h_trans)  # [1, T, hidden]
-        h_bottleneck = h_bottleneck.squeeze(0)  # [T, hidden]
-        
-        # UNet Skip Connection: 融合编码器特征和瓶颈特征
-        h_skip = torch.cat([h_encoded, h_bottleneck], dim=-1)  # [T, hidden*2]
-        h_skip = self.skip_proj(h_skip)  # [T, hidden]
-        
+            h = self.encoder(x, edge_index)
+        # Prepare for transformer: add batch dim
+        h_trans = h.unsqueeze(0)  # [1, T, hidden]
+        h_trans = self.bottleneck(h_trans)  # [1, T, hidden]
+        h = h_trans.squeeze(0)  # [T, hidden]
         # 分类分支：全局平均池化
-        h_cls = h_skip.mean(dim=0)  # [hidden]
+        h_cls = h.mean(dim=0)  # [hidden]
         logits = self.classifier(h_cls)  # [num_classes]
-        
-        # UNet Decode: GAT上采样
+        # Decode
         if return_attention:
-            out, decoder_attn = self.decoder(h_skip, edge_index, return_attention=True)  # [T, out_channels], list
+            out, decoder_attn = self.decoder(h, edge_index, return_attention=True)  # [T, out_channels], list
             # Return output, attention maps, and logits
             return out.t(), encoder_attn, decoder_attn, logits
-        out = self.decoder(h_skip, edge_index)  # [T, out_channels]
+        out = self.decoder(h, edge_index)  # [T, out_channels]
         out_t = out.t()  # [out_channels, T]
-        
         if phase == "encode":
             # encode 阶段：返回 (out, logits)
             return out_t, logits
@@ -242,146 +229,3 @@ class TGATUNet(nn.Module):
         except:
             # 回退到标准批量处理
             return self.forward_batch(windows_batch)
-    
-    def forward_staged(self, window, stage="reconstruction", return_attention=False):
-        """
-        分阶段前向传播
-        Args:
-            window: 输入窗口数据
-            stage: "reconstruction" | "classification" | "both"
-            return_attention: 是否返回注意力权重
-        Returns:
-            根据stage返回不同内容：
-            - "reconstruction": (重建输出, None)
-            - "classification": (None, 分类输出) 
-            - "both": (重建输出, 分类输出)
-        """
-        device = window.device
-        data = build_graph(window, time_k=self.time_k)
-        x = data.x.to(device) if data.x is not None else None
-        edge_index = data.edge_index.to(device) if data.edge_index is not None else None
-        
-        # Encode: 总是需要执行
-        if return_attention:
-            h, encoder_attn = self.encoder(x, edge_index, return_attention=True)
-        else:
-            h = self.encoder(x, edge_index)
-            encoder_attn = None
-        
-        # Transformer bottleneck: 总是需要执行
-        h_trans = h.unsqueeze(0)  # [1, T, hidden]
-        h_trans = self.bottleneck(h_trans)  # [1, T, hidden]
-        h = h_trans.squeeze(0)  # [T, hidden]
-        
-        # 根据阶段决定执行哪些分支
-        reconstruction_out = None
-        classification_out = None
-        decoder_attn = None
-        
-        if stage in ["reconstruction", "both"]:
-            # 执行重建分支
-            if return_attention:
-                out, decoder_attn = self.decoder(h, edge_index, return_attention=True)
-            else:
-                out = self.decoder(h, edge_index)
-            reconstruction_out = out.t()  # [out_channels, T]
-        
-        if stage in ["classification", "both"]:
-            # 执行分类分支
-            h_cls = h.mean(dim=0)  # [hidden] - 全局平均池化
-            classification_out = self.classifier(h_cls)  # [num_classes]
-        
-        if return_attention:
-            return reconstruction_out, classification_out, encoder_attn, decoder_attn
-        else:
-            return reconstruction_out, classification_out
-
-    def forward_batch_staged(self, windows_batch, stage="reconstruction"):
-        """
-        分阶段批量前向传播
-        Args:
-            windows_batch: [batch_size, T, C] 批量窗口数据
-            stage: "reconstruction" | "classification" | "both"
-        Returns:
-            根据stage返回 (batch_recon_out, batch_cls_out)
-            不需要的输出为None
-        """
-        batch_size, T, C = windows_batch.size()
-        
-        batch_recon_outputs = []
-        batch_cls_outputs = []
-        
-        for i in range(batch_size):
-            window = windows_batch[i]  # [T, C]
-            result = self.forward_staged(window, stage=stage)
-            
-            if len(result) == 2:
-                recon_out, cls_out = result
-            else:
-                recon_out, cls_out = result[0], result[1]  # 忽略attention权重
-            
-            if recon_out is not None:
-                batch_recon_outputs.append(recon_out)
-            if cls_out is not None:
-                batch_cls_outputs.append(cls_out)
-        
-        # 堆叠结果
-        batch_recon_out = torch.stack(batch_recon_outputs, dim=0) if batch_recon_outputs else None
-        batch_cls_out = torch.stack(batch_cls_outputs, dim=0) if batch_cls_outputs else None
-        
-        return batch_recon_out, batch_cls_out
-
-    def set_stage_gradients(self, stage="reconstruction"):
-        """
-        设置特定阶段的梯度计算
-        Args:
-            stage: "reconstruction" | "classification" | "both"
-        """
-        # 首先关闭所有梯度
-        for param in self.parameters():
-            param.requires_grad = False
-        
-        # 编码器和Transformer总是需要梯度（因为是共享的）
-        for param in self.encoder.parameters():
-            param.requires_grad = True
-        for param in self.bottleneck.parameters():
-            param.requires_grad = True
-        
-        if stage in ["reconstruction", "both"]:
-            # 开启解码器梯度
-            for param in self.decoder.parameters():
-                param.requires_grad = True
-        
-        if stage in ["classification", "both"]:
-            # 开启分类器梯度
-            for param in self.classifier.parameters():
-                param.requires_grad = True
-
-    def freeze_reconstruction_branch(self):
-        """冻结重建分支（编码器+解码器）"""
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        for param in self.decoder.parameters():
-            param.requires_grad = False
-        # 保持Transformer和分类器可训练
-        for param in self.bottleneck.parameters():
-            param.requires_grad = True
-        for param in self.classifier.parameters():
-            param.requires_grad = True
-
-    def freeze_classification_branch(self):
-        """冻结分类分支"""
-        for param in self.classifier.parameters():
-            param.requires_grad = False
-        # 保持重建相关组件可训练
-        for param in self.encoder.parameters():
-            param.requires_grad = True
-        for param in self.bottleneck.parameters():
-            param.requires_grad = True
-        for param in self.decoder.parameters():
-            param.requires_grad = True
-
-    def unfreeze_all(self):
-        """解冻所有参数"""
-        for param in self.parameters():
-            param.requires_grad = True
