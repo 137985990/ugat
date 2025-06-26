@@ -273,17 +273,13 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                                                     common_indices, criterion, C, batch_size, need_indices,
                                                     training_strategy, have_indices, source_datasets, dataset, current_epoch)
                 
-                # 阶段2: 双路径分类训练 - 对比缺失Need通道 vs 重建Need通道的分类性能
-                # 路径1: 缺失Need通道的数据分类 (N=0+C真+H真) → 分类器 → 基准性能
-                incomplete_data = batch.clone()
-                if need_indices:
-                    for need_idx in need_indices:
-                        if need_idx < incomplete_data.size(1):
-                            incomplete_data[:, need_idx, :] = 0  # 将Need通道设为0，模拟缺失
+                # 阶段2: 双路径分类训练
+                # 路径1: 原始数据分类 (N初始0+C真+H真) → GAT特征提取 → Transformer瓶颈 → 分类器 → 损失1
+                original_data = batch.clone()  # 使用原始数据（包含初始Need=0）
+                _, original_logits = forward_batch_parallel(model, original_data, device)
                 
-                _, incomplete_logits = forward_batch_parallel(model, incomplete_data, device)
-                
-                # 路径2: 重建Need通道的完整数据分类 (N重建+C真+H真) → 分类器 → 目标性能
+                # 路径2: 重建数据分类 (N重建+C真+H真) → GAT特征提取 → Transformer瓶颈 → 分类器 → 损失2
+                # 合成完整数据：重建的Need + 真实的C和H
                 enhanced_data = batch.clone()
                 if need_indices:
                     for need_idx in need_indices:
@@ -292,19 +288,15 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                 
                 _, enhanced_logits = forward_batch_parallel(model, enhanced_data, device)
                 
-                # 计算分类损失而不是准确率（用于梯度优化）
-                incomplete_cls_loss = nn.CrossEntropyLoss()(incomplete_logits, labels)
-                enhanced_cls_loss = nn.CrossEntropyLoss()(enhanced_logits, labels)
-                
-                # 计算准确率用于监控
-                incomplete_preds = torch.argmax(incomplete_logits, dim=1)
+                # 计算分类准确率
+                original_preds = torch.argmax(original_logits, dim=1)
                 enhanced_preds = torch.argmax(enhanced_logits, dim=1)
-                incomplete_accuracy = (incomplete_preds == labels).float().mean()
-                enhanced_accuracy = (enhanced_preds == labels).float().mean()
                 
-                # 分类改进损失：鼓励重建后的分类性能优于缺失数据的分类性能
-                # 目标：enhanced_cls_loss < incomplete_cls_loss
-                cls_improvement_loss = enhanced_cls_loss - incomplete_cls_loss + 0.1  # 添加margin确保改进
+                original_accuracy = (original_preds == labels).float().mean()
+                enhanced_accuracy = (enhanced_preds == labels).float().mean()                # 分类改进损失：鼓励重建数据提升分类性能
+                # 总损失 = α×重建损失 + β×(分类准确率1 - 分类准确率2)
+                # 当重建数据分类更准确时，损失更小，鼓励这种行为
+                cls_improvement_loss = original_accuracy - enhanced_accuracy
                 
                 # 总损失 = 加权重建损失 + 加权分类改进损失
                 loss = (recon_weight * recon_loss + cls_improvement_weight * cls_improvement_loss) / accumulate_grad_batches
@@ -326,17 +318,12 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                                                 common_indices, criterion, C, batch_size, need_indices,
                                                 training_strategy, have_indices, source_datasets, dataset, current_epoch)
             
-            # 阶段2: 双路径分类训练 - 对比缺失Need通道 vs 重建Need通道的分类性能
-            # 路径1: 缺失Need通道的数据分类 (N=0+C真+H真) → 分类器 → 基准性能
-            incomplete_data = batch.clone()
-            if need_indices:
-                for need_idx in need_indices:
-                    if need_idx < incomplete_data.size(1):
-                        incomplete_data[:, need_idx, :] = 0  # 将Need通道设为0，模拟缺失
+            # 阶段2: 双路径分类训练
+            # 路径1: 原始数据分类
+            original_data = batch.clone()
+            _, original_logits = forward_batch_parallel(model, original_data, device)
             
-            _, incomplete_logits = forward_batch_parallel(model, incomplete_data, device)
-            
-            # 路径2: 重建Need通道的完整数据分类 (N重建+C真+H真) → 分类器 → 目标性能
+            # 路径2: 重建数据分类
             enhanced_data = batch.clone()
             if need_indices:
                 for need_idx in need_indices:
@@ -345,19 +332,13 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
             
             _, enhanced_logits = forward_batch_parallel(model, enhanced_data, device)
             
-            # 计算分类损失而不是准确率（用于梯度优化）
-            incomplete_cls_loss = nn.CrossEntropyLoss()(incomplete_logits, labels)
-            enhanced_cls_loss = nn.CrossEntropyLoss()(enhanced_logits, labels)
-            
-            # 计算准确率用于监控
-            incomplete_preds = torch.argmax(incomplete_logits, dim=1)
+            # 计算分类准确率
+            original_preds = torch.argmax(original_logits, dim=1)
             enhanced_preds = torch.argmax(enhanced_logits, dim=1)
-            incomplete_accuracy = (incomplete_preds == labels).float().mean()
-            enhanced_accuracy = (enhanced_preds == labels).float().mean()
             
-            # 分类改进损失：鼓励重建后的分类性能优于缺失数据的分类性能
-            # 目标：enhanced_cls_loss < incomplete_cls_loss
-            cls_improvement_loss = enhanced_cls_loss - incomplete_cls_loss + 0.1  # 添加margin确保改进
+            original_accuracy = (original_preds == labels).float().mean()
+            enhanced_accuracy = (enhanced_preds == labels).float().mean()            # 分类改进损失：总损失 = α×重建损失 + β×(分类准确率1 - 分类准确率2)
+            cls_improvement_loss = original_accuracy - enhanced_accuracy
             
             # 总损失 = 加权重建损失 + 加权分类改进损失
             loss = (recon_weight * recon_loss + cls_improvement_weight * cls_improvement_loss) / accumulate_grad_batches
@@ -374,7 +355,7 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
         original_cls_improvement = cls_improvement_loss
         
         # 统计分类正确数
-        total_original_correct += (incomplete_preds == labels).sum().item()
+        total_original_correct += (original_preds == labels).sum().item()
         total_reconstructed_correct += (enhanced_preds == labels).sum().item()
         total_samples += batch_size        # 安全地获取损失值
         if isinstance(original_loss, torch.Tensor):
@@ -409,10 +390,10 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
             optimizer.step()
     
     n = len(dataloader.dataset)
-    incomplete_acc = total_original_correct / total_samples if total_samples > 0 else 0.0
+    original_acc = total_original_correct / total_samples if total_samples > 0 else 0.0
     reconstructed_acc = total_reconstructed_correct / total_samples if total_samples > 0 else 0.0
     print(f"[采样分布] 本轮训练各source_dataset采样数: {source_dataset_counter}")
-    return total_loss / n, total_recon_loss / n, total_cls_improvement_loss / n, incomplete_acc, reconstructed_acc
+    return total_loss / n, total_recon_loss / n, total_cls_improvement_loss / n, original_acc, reconstructed_acc
 
 
 def forward_batch_parallel(model, input_batch, device):
@@ -896,7 +877,7 @@ def main():
         logger.info("使用标准MSE损失函数")    # 训练主循环
     logger.info(f"开始训练，总轮数: {epochs}")
     for epoch in range(1, epochs + 1):
-        train_loss, train_recon, train_cls_improvement, train_incomplete_acc, train_reconstructed_acc = train_phased_with_grad_accumulation(
+        train_loss, train_recon, train_cls_improvement, train_original_acc, train_reconstructed_acc = train_phased_with_grad_accumulation(
             model, train_loader, optimizer, criterion, device, [],
             accumulate_grad_batches=config.get('accumulate_grad_batches', 2),
             use_mixed_precision=AMP_AVAILABLE and config.get('use_amp', False), scaler=scaler,
@@ -916,14 +897,14 @@ def main():
         
         # 日志记录
         logger.info(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_recon={train_recon:.6f}, "
-                   f"train_incomplete_acc={train_incomplete_acc:.4f}, train_reconstructed_acc={train_reconstructed_acc:.4f}, "
+                   f"train_original_acc={train_original_acc:.4f}, train_reconstructed_acc={train_reconstructed_acc:.4f}, "
                    f"val_loss={val_loss:.6f}, val_recon={val_recon:.6f}, lr={current_lr:.6e}")
         
         # TensorBoard记录
         writer.add_scalar('Train/Loss', train_loss, epoch)
         writer.add_scalar('Train/Recon_Loss', train_recon, epoch)
         writer.add_scalar('Train/Cls_Improvement_Loss', train_cls_improvement, epoch)
-        writer.add_scalar('Train/Incomplete_Acc', train_incomplete_acc, epoch)
+        writer.add_scalar('Train/Original_Acc', train_original_acc, epoch)
         writer.add_scalar('Train/Reconstructed_Acc', train_reconstructed_acc, epoch)
         writer.add_scalar('Val/Loss', val_loss, epoch)
         writer.add_scalar('Val/Recon_Loss', val_recon, epoch)

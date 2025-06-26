@@ -5,15 +5,6 @@ data_files:
   - ../Data/MEFAR_original.csv
 block_col: block
 label_col: F  # 使用原始的大写F列
-
-# 标签配平配置
-label_balancing:
-  enabled: true                # 是否启用标签配平
-  target_datasets: ["FM"]      # 需要配平的数据集列表
-  strategy: "undersample"      # 配平策略: undersample, oversample, smote
-  target_ratio: null           # 目标比例，null表示完全平衡
-  random_seed: 42              # 配平时的随机种子
-
 ## 指定本次训练/推理用的模态（FM、OD、MEFAR三者的去重并集，顺序可自定义）
 common_modalities:
   - acc_x
@@ -169,40 +160,11 @@ loss_config:
   type: "multimodal"           # 损失函数类型: basic, multimodal
   recon_weight: 1.0            # 重建损失权重 (α)
   cls_weight: 3.0              # 分类损失权重
-  cls_improvement_weight: 2.0  # 分类改进损失权重 (β)
-  base_classification_weight: 1.0  # 基础分类监督损失权重（新增）
-  
-  # 优化后的准确率奖励机制
-  accuracy_reward_scale: 0.5   # 准确率奖励系数（降低以增加稳定性）
-  accuracy_threshold: 0.02     # 准确率提升阈值（降低以提高敏感度）
-  min_improvement_margin: 0.01 # 最小改进margin（降低初始要求）
-  
-  # 动态权重调整
-  dynamic_weighting: true      # 是否启用动态权重调整
-  weight_smoothing: true       # 是否使用权重平滑（新增）
-  
-  # 渐进式训练配置
-  progressive_margin: true     # 是否启用渐进式margin（新增）
-  margin_growth_rate: 0.1      # margin增长率（新增）
-  
-  # 损失稳定性配置
-  gradient_clipping: true      # 是否启用梯度裁剪
-  loss_smoothing: true         # 是否启用损失平滑（新增）
-  smoothing_factor: 0.9        # 平滑因子（新增）
-  
-  # 分类训练强化配置（新增）
-  classification_supervision: true  # 是否启用分类监督训练
-  balanced_loss_strategy: true      # 是否使用平衡损失策略
-  
-  # 循环渐进训练策略说明：
-  # 路径1: 输入数据分类 (Common真实 + Have真实 + Need初始值/上轮生成) → 基准性能
-  # 路径2: 重建数据分类 (Common真实 + Have真实 + Need当前生成) → 目标性能
-  # 目标: 每轮训练都让路径2的分类效果比路径1更好，实现循序渐进的Need通道补全
-  
+  cls_improvement_weight: 1.0  # 分类改进损失权重 (β) - 新增
   common_weight: 1.0           # common_modalities权重（稍高，因为是真实数据）
   have_weight: 1.0             # have_modalities权重
   l1_weight: 0.1               # L1正则化权重
-  adaptive: false              # 是否使用自适应权重调整
+  adaptive: false               # 是否使用自适应权重调整
   
   # 详细损失监控
   log_detailed_losses: true    # 是否记录详细损失信息
