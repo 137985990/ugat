@@ -115,11 +115,11 @@ window_size: 320  # 32*10.0
 step_size: 96     # 32*3.0
 norm_method: zscore
 train_split: 0.6
-# 针对稳定性优化的配置（保守调整）
-batch_size: 16                   # 减少batch size提高稳定性
-epochs: 500                      # 减少epoch数专注质量
-lr: 0.0008                       # 稍微增加学习率
-patience: 50                     # 增加patience
+# 针对32GB内存+16GB显存的配置（最大化显存利用）
+batch_size: 32                  # 大幅增加batch size，充分利用16GB显存
+epochs: 2000
+lr: 0.0005                        # 相应调整学习率
+patience: 30
 accumulate_grad_batches: 1       # 减少梯度累积，直接使用大batch
 
 # 高性能优化配置 - 最大化显存利用版本
@@ -144,7 +144,7 @@ use_unet_architecture: true    # 使用真正的U-Net架构
 enable_attention_viz: false     # 启用注意力可视化
 
 # 训练策略配置
-training_strategy: "mask_have"  # 可选: "no_mask" (输入完整C+N+H) 或 "mask_have" (遮掩Have通道)
+training_strategy: "no_mask"  # 可选: "no_mask" (输入完整C+N+H) 或 "mask_have" (遮掩Have通道)
 # no_mask: 输入完整C+N+H，只对C+H计算损失，只更新Need
 # mask_have: 遮掩所有Have通道，用C+N重建Have，符合实际问题场景
 
@@ -172,10 +172,10 @@ loss_config:
   cls_improvement_weight: 2.0  # 分类改进损失权重 (β)
   base_classification_weight: 1.0  # 基础分类监督损失权重（新增）
   
-  # 优化后的准确率奖励机制（稳定性优先）
-  accuracy_reward_scale: 0.2      # 降低奖励系数增加稳定性
-  accuracy_threshold: 0.01        # 降低阈值提高敏感度
-  min_improvement_margin: 0.005   # 降低初始要求
+  # 优化后的准确率奖励机制
+  accuracy_reward_scale: 0.5   # 准确率奖励系数（降低以增加稳定性）
+  accuracy_threshold: 0.02     # 准确率提升阈值（降低以提高敏感度）
+  min_improvement_margin: 0.01 # 最小改进margin（降低初始要求）
   
   # 动态权重调整
   dynamic_weighting: true      # 是否启用动态权重调整
