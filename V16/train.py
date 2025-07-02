@@ -376,7 +376,7 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
         if use_mixed_precision and scaler is not None and AMP_AVAILABLE:
             with autocast():
                 # 阶段1: 重建训练 - 输入时间序列 → GAT编码器 → Transformer瓶颈 → GAT解码器 → 重建输出
-                batch_reconstructed, _ = forward_batch_parallel(model, masked, device)
+                batch_reconstructed, _ = forward_batch_parallel_compat(model, masked, device)
                 
                 # 计算重建损失
                 recon_loss = compute_batch_recon_loss(batch, batch_reconstructed, is_real_mask, 
@@ -386,7 +386,7 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                 # 阶段2: 双路径分类训练 - 使用UNet内置分类器（V13方式）
                 # 路径1: 输入数据分类 (Common真+Have真+Need初始/上轮生成) → UNet分类器 → 基准性能
                 # 注意：输入batch本身就包含了当前的Need值（0或上轮生成的结果）
-                _, input_logits = forward_batch_parallel(model, batch, device)
+                _, input_logits = forward_batch_parallel_compat(model, batch, device)
                 
                 # 路径2: 重建数据分类 (Common真+Have真+Need当前生成) → UNet分类器 → 目标性能
                 # 构建增强数据：保留Common+Have，用当前模型生成的Need替换
@@ -403,7 +403,7 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                         if need_idx < batch_reconstructed.size(1):
                             enhanced_data[i, need_idx, :] = batch_reconstructed[i, need_idx, :]
                 
-                _, enhanced_logits = forward_batch_parallel(model, enhanced_data, device)
+                _, enhanced_logits = forward_batch_parallel_compat(model, enhanced_data, device)
                 
                 # 计算分类损失（用于梯度优化）
                 input_cls_loss = nn.CrossEntropyLoss()(input_logits, labels)
@@ -471,14 +471,14 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
         else:
             # 标准精度训练 - 相同逻辑
             # 阶段1: 重建训练
-            batch_reconstructed, _ = forward_batch_parallel(model, masked, device)            # 计算重建损失
+            batch_reconstructed, _ = forward_batch_parallel_compat(model, masked, device)            # 计算重建损失
             recon_loss = compute_batch_recon_loss(batch, batch_reconstructed, is_real_mask, 
                                                 common_indices, criterion, C, batch_size, need_indices,
                                                 training_strategy, have_indices, source_datasets, dataset, current_epoch)
             
             # 阶段2: 双路径分类训练 - 使用UNet内置分类器（V13方式）
             # 路径1: 输入数据分类 (Common真+Have真+Need初始/上轮生成) → UNet分类器 → 基准性能
-            _, input_logits = forward_batch_parallel(model, batch, device)
+            _, input_logits = forward_batch_parallel_compat(model, batch, device)
             
             # 路径2: 重建数据分类 (Common真+Have真+Need当前生成) → UNet分类器 → 目标性能
             # 构建增强数据：保留Common+Have，用当前模型生成的Need替换  
@@ -495,7 +495,7 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                     if need_idx < batch_reconstructed.size(1):
                         enhanced_data[i, need_idx, :] = batch_reconstructed[i, need_idx, :]
             
-            _, enhanced_logits = forward_batch_parallel(model, enhanced_data, device)
+            _, enhanced_logits = forward_batch_parallel_compat(model, enhanced_data, device)
             
             # 计算各路径的分类损失
             input_cls_loss = nn.CrossEntropyLoss()(input_logits, labels)
@@ -511,9 +511,11 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
             # 优化策略：基于输入数据做监督 + 鼓励生成数据分类性能提升
             
             # 1. 基础分类监督损失：使用输入数据做监督信号
+            # 输入数据包含真实的Common+Have + 当前的Need值（初始0或上轮生成结果）
             base_classification_loss = input_cls_loss
             
             # 2. 循环改进损失：鼓励生成数据的分类性能优于输入数据
+            # 这样每轮训练都会让Need生成值变得更好
             classification_improvement_loss = enhanced_cls_loss - input_cls_loss
             
             # 3. 准确率差值（用于监控和奖励）
@@ -551,7 +553,6 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
             
             # 在累积周期结束时更新参数
             if (step_count + 1) % accumulate_grad_batches == 0:
-                # 对UNet模型参数进行梯度裁剪（V13方式）
                 clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
         
@@ -630,27 +631,92 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
     return total_loss / n, total_recon_loss / n, total_cls_improvement_loss / n, input_acc, reconstructed_acc, 0.0
 
 
-def forward_batch_parallel(model, input_batch, device):
+def forward_batch_parallel(model, input_batch, device, use_generation_validator=False):
+    """
+    批量前向传播的包装器函数，兼容现有代码
+    Args:
+        model: 模型
+        input_batch: 输入批量数据
+        device: 设备
+        use_generation_validator: 是否使用验证生成分类器
+    Returns:
+        如果use_generation_validator=False: (batch_out, batch_logits)
+        如果use_generation_validator=True: (batch_out, batch_logits, batch_gen_logits)
+    """
     batch_size, C, T = input_batch.size()
     
     # 批量转置: [batch_size, C, T] -> [batch_size, T, C] 
     windows = input_batch.transpose(1, 2)  # [batch_size, T, C]
       # 尝试真正的批量处理 - 直接处理整个batch
     try:
-        batch_out, batch_logits = model.forward_batch(windows)
-        return batch_out, batch_logits  # [batch_size, C, T], [batch_size, num_classes]
+        if use_generation_validator:
+            batch_out, batch_logits, batch_gen_logits = model.forward_batch(windows, use_generation_validator=True)
+            return batch_out, batch_logits, batch_gen_logits  # [batch_size, C, T], [batch_size, num_classes], [batch_size, num_classes]
+        else:
+            batch_out, batch_logits = model.forward_batch(windows, use_generation_validator=False)
+            return batch_out, batch_logits  # [batch_size, C, T], [batch_size, num_classes]
     except AttributeError:
         try:
             def single_forward(window):
-                out, logits = model(window)
-                return out.t(), logits  # [C, T], [num_classes]
+                if use_generation_validator:
+                    result = model(window, use_generation_validator=True)
+                    if len(result) == 3:
+                        out, logits, gen_logits = result
+                    else:
+                        out, logits, gen_logits = result[0], result[-2], result[-1]
+                    return out.t(), logits, gen_logits  # [C, T], [num_classes], [num_classes]
+                else:
+                    out, logits = model(window)
+                    return out.t(), logits  # [C, T], [num_classes]
             
             # 使用vmap进行真正的并行化
             vmapped_forward = torch.vmap(single_forward, in_dims=0, out_dims=0)
-            batch_out, batch_logits = vmapped_forward(windows)
-            return batch_out, batch_logits  # [batch_size, C, T], [batch_size, num_classes]
-        except:
-            return forward_large_batch_optimized(model, windows, device)
+            if use_generation_validator:
+                batch_out, batch_logits, batch_gen_logits = vmapped_forward(windows)
+                return batch_out, batch_logits, batch_gen_logits
+            else:
+                batch_out, batch_logits = vmapped_forward(windows)
+                return batch_out, batch_logits
+        except Exception as e:
+            print(f"[DEBUG] vmap failed: {e}, falling back to sequential processing")
+            
+            # 最终回退到循环处理
+            batch_outputs = []
+            batch_logits_list = []
+            batch_gen_logits_list = []
+            
+            for i in range(batch_size):
+                window = windows[i]  # [T, C]
+                if use_generation_validator:
+                    result = model(window, use_generation_validator=True)
+                    if len(result) == 3:
+                        out, logits, gen_logits = result
+                    else:
+                        out, logits, gen_logits = result[0], result[-2], result[-1]
+                    batch_outputs.append(out.t())  # [C, T]
+                    batch_logits_list.append(logits)
+                    batch_gen_logits_list.append(gen_logits)
+                else:
+                    out, logits = model(window)
+                    batch_outputs.append(out.t())  # [C, T]
+                    batch_logits_list.append(logits)
+            
+            batch_out = torch.stack(batch_outputs, dim=0)  # [batch_size, C, T]
+            batch_logits = torch.stack(batch_logits_list, dim=0)  # [batch_size, num_classes]
+            
+            if use_generation_validator:
+                batch_gen_logits = torch.stack(batch_gen_logits_list, dim=0)  # [batch_size, num_classes]
+                return batch_out, batch_logits, batch_gen_logits
+            else:
+                return batch_out, batch_logits
+
+
+def forward_batch_parallel_compat(model, input_batch, device):
+    """
+    兼容旧代码的前向传播函数，始终返回2个值
+    """
+    result = forward_batch_parallel(model, input_batch, device, use_generation_validator=False)
+    return result[0], result[1]  # 只返回 batch_out, batch_logits
 
 
 def forward_large_batch_optimized(model, windows, device):
@@ -973,7 +1039,7 @@ def eval_loop(model, dataloader, criterion, device, mask_indices, need_indices=N
             recon_loss = 0.0
             
             # 批量处理重建和分类
-            batch_reconstructed, _ = forward_batch_parallel(model, masked, device)
+            batch_reconstructed, _ = forward_batch_parallel_compat(model, masked, device)
             
             # 构建输入数据用于分类 (Common真+Have真+Need当前值)
             # 注意：Need通道使用当前数据集中的值（可能是0或循环更新后的值）
@@ -993,8 +1059,8 @@ def eval_loop(model, dataloader, criterion, device, mask_indices, need_indices=N
                         enhanced_data[i, need_idx, :] = batch_reconstructed[i, need_idx, :]
             
             # 分类评估 - 使用UNet内置分类器（V13方式）
-            _, input_logits = forward_batch_parallel(model, input_data, device)
-            _, enhanced_logits = forward_batch_parallel(model, enhanced_data, device)
+            _, input_logits = forward_batch_parallel_compat(model, input_data, device)
+            _, enhanced_logits = forward_batch_parallel_compat(model, enhanced_data, device)
             
             # 计算准确率
             input_preds = torch.argmax(input_logits, dim=1)
@@ -1055,6 +1121,254 @@ def eval_loop(model, dataloader, criterion, device, mask_indices, need_indices=N
     reconstructed_acc = total_reconstructed_correct / total_samples if total_samples > 0 else 0.0
     
     return total_loss / n, total_recon_loss / n, input_acc, reconstructed_acc
+
+def eval_with_generation_validator(model, dataloader, criterion, device, mask_indices, need_indices=None, dataset=None):
+    """
+    增强评估函数 - 计算重建损失和三路径分类准确率（含验证生成分类器）
+    
+    Returns:
+        tuple: (total_loss, total_recon_loss, input_acc, reconstructed_acc, generation_validator_acc)
+               其中 input_acc 是输入数据准确率 (Common真+Have真+Need当前值)
+               reconstructed_acc 是重建数据准确率 (Common真+Have真+Need生成值)
+               generation_validator_acc 是验证生成分类器准确率 (基于生成数据的专门分类器)
+               
+    注意：验证生成分类器直接基于解码器输出进行分类，可以监控生成质量
+    """
+    model.eval()
+    total_loss = 0.0
+    total_recon_loss = 0.0
+    total_input_correct = 0   # 输入数据分类正确数
+    total_reconstructed_correct = 0  # 重建数据分类正确数
+    total_generation_validator_correct = 0  # 验证生成分类正确数
+    total_samples = 0
+    
+    # 获取common模态索引
+    common_indices = getattr(criterion, 'common_indices', [])
+    need_indices = need_indices if need_indices is not None else []
+    
+    with torch.no_grad():
+        for batch_data in tqdm(dataloader, desc="Eval with Generation Validator"):
+            if len(batch_data) == 4:
+                batch, labels, _, is_real_mask = batch_data
+                source_datasets = ['UNKNOWN'] * batch.size(0)
+            else:
+                batch, labels, _, is_real_mask, source_datasets = batch_data
+            
+            batch = batch.to(device)
+            labels = labels.to(device)
+            is_real_mask = is_real_mask.to(device)
+            
+            # 动态遮掩
+            masked = mask_channel(batch, source_datasets, dataset)
+            batch_size, C, T = batch.size()
+            loss = 0.0
+            recon_loss = 0.0
+            
+            # 批量处理重建和分类（带验证生成分类器）
+            result = forward_batch_parallel(model, masked, device, use_generation_validator=True)
+            if len(result) == 3:
+                batch_reconstructed, _, batch_gen_logits = result
+            else:
+                # 回退处理：如果返回2个值，说明模型不支持验证生成分类器
+                batch_reconstructed, _ = result
+                # 创建一个基础的验证生成分类结果
+                batch_gen_logits = torch.zeros((batch_size, 2), device=device)
+            
+            # 构建输入数据用于分类 (Common真+Have真+Need当前值)
+            input_data = batch.clone()  # 直接使用当前batch，包含循环更新后的Need值
+            
+            # 构建重建数据用于分类 (Common真+Have真+Need生成)
+            # 根据每个样本的source_dataset动态确定Need通道并用生成值替换
+            enhanced_data = batch.clone()
+            for i in range(batch_size):
+                src = source_datasets[i] if i < len(source_datasets) else 'UNKNOWN'
+                sample_need_indices = dataset.get_need_indices_for_dataset(src) if dataset is not None else []
+                
+                # 用重建结果替换该样本的Need通道
+                for need_idx in sample_need_indices:
+                    if need_idx < batch_reconstructed.size(1):
+                        enhanced_data[i, need_idx, :] = batch_reconstructed[i, need_idx, :]
+            
+            # 三路径分类评估
+            _, input_logits = forward_batch_parallel_compat(model, input_data, device)
+            _, enhanced_logits = forward_batch_parallel_compat(model, enhanced_data, device)
+            
+            # 计算准确率
+            input_preds = torch.argmax(input_logits, dim=1)
+            enhanced_preds = torch.argmax(enhanced_logits, dim=1)
+            generation_validator_preds = torch.argmax(batch_gen_logits, dim=1)
+            
+            total_input_correct += (input_preds == labels).sum().item()
+            total_reconstructed_correct += (enhanced_preds == labels).sum().item()
+            total_generation_validator_correct += (generation_validator_preds == labels).sum().item()
+            total_samples += batch_size
+            
+            # 计算重建损失 (保持原有逻辑)
+            for i in range(batch_size):
+                window = masked[i].t()
+                out, _ = model(window)
+                
+                # 获取真实通道信息
+                if is_real_mask.dim() == 2:
+                    real_channels = is_real_mask[i]
+                else:
+                    real_channels = is_real_mask
+                
+                recon_loss_i = 0.0
+                real_count = 0
+                
+                for c in range(C):
+                    target = batch[i, c, :]
+                    pred = out[c, :]
+                    
+                    # 判断是否为common模态
+                    is_common_channel = c in common_indices
+                    
+                    if is_common_channel:
+                        # Common模态：始终计算损失
+                        if hasattr(criterion, '__call__') and criterion.__class__.__name__ != 'MSELoss':
+                            recon_loss_i = recon_loss_i + criterion(pred, target, channel_idx=c, is_common=True)
+                        else:
+                            recon_loss_i = recon_loss_i + criterion(pred, target)
+                        real_count += 1
+                    elif real_channels[c]:
+                        # Have模态：只对真实通道计算损失
+                        if hasattr(criterion, '__call__') and criterion.__class__.__name__ != 'MSELoss':
+                            recon_loss_i = recon_loss_i + criterion(pred, target, channel_idx=c, is_common=False)
+                        else:
+                            recon_loss_i = recon_loss_i + criterion(pred, target)
+                        real_count += 1
+                
+                if real_count > 0:
+                    recon_loss_i = recon_loss_i / real_count
+                
+                loss += recon_loss_i
+                recon_loss += recon_loss_i
+            
+            loss = loss / batch_size
+            total_loss += loss.item() * batch_size
+            total_recon_loss += recon_loss
+    
+    n = len(dataloader.dataset)
+    input_acc = total_input_correct / total_samples if total_samples > 0 else 0.0
+    reconstructed_acc = total_reconstructed_correct / total_samples if total_samples > 0 else 0.0
+    generation_validator_acc = total_generation_validator_correct / total_samples if total_samples > 0 else 0.0
+    
+    return total_loss / n, total_recon_loss / n, input_acc, reconstructed_acc, generation_validator_acc
+
+
+def train_generation_validator_only(model, dataloader, optimizer, criterion, device, mask_indices, 
+                                  accumulate_grad_batches=2, use_mixed_precision=True, scaler=None, 
+                                  dataset=None, current_epoch=1):
+    """
+    专门训练验证生成分类器的函数
+    冻结其他参数，只训练generation_validator分支
+    """
+    model.train()
+    
+    # 冻结除了验证生成分类器之外的所有参数
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.generation_validator.parameters():
+        param.requires_grad = True
+    
+    # 但需要编码器+解码器参与前向传播，只是不更新梯度
+    # 这样可以保证生成的特征是稳定的
+    
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    step_count = 0
+    
+    for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Training Generation Validator")):
+        if len(batch_data) == 5:
+            batch, labels, _, is_real_mask, source_datasets = batch_data
+        elif len(batch_data) == 4:
+            batch, labels, _, is_real_mask = batch_data
+            source_datasets = ['UNKNOWN'] * batch.size(0)
+        else:
+            batch, labels, _, is_real_mask, source_datasets = batch_data
+        
+        batch = batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        
+        # 动态遮掩
+        masked = mask_channel(batch, source_datasets, dataset)
+        batch_size = batch.size(0)
+        
+        # 梯度累积：只在累积周期开始时清零梯度
+        if step_count % accumulate_grad_batches == 0:
+            optimizer.zero_grad()
+        
+        if use_mixed_precision and scaler is not None and AMP_AVAILABLE:
+            with autocast():
+                # 获取生成验证分类结果
+                result = forward_batch_parallel(model, masked, device, use_generation_validator=True)
+                if len(result) == 3:
+                    _, _, gen_logits = result
+                else:
+                    # 回退处理
+                    _, _ = result
+                    gen_logits = torch.zeros((batch_size, 2), device=device)
+                
+                # 计算分类损失
+                gen_cls_loss = nn.CrossEntropyLoss()(gen_logits, labels)
+                loss = gen_cls_loss / accumulate_grad_batches
+            
+            # 混合精度反向传播
+            scaler.scale(loss).backward()
+            
+            # 在累积周期结束时更新参数
+            if (step_count + 1) % accumulate_grad_batches == 0:
+                scaler.unscale_(optimizer)
+                # 只对验证生成分类器进行梯度裁剪
+                clip_grad_norm_(model.generation_validator.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+        else:
+            # 标准精度训练
+            result = forward_batch_parallel(model, masked, device, use_generation_validator=True)
+            if len(result) == 3:
+                _, _, gen_logits = result
+            else:
+                # 回退处理
+                _, _ = result
+                gen_logits = torch.zeros((batch_size, 2), device=device)
+            gen_cls_loss = nn.CrossEntropyLoss()(gen_logits, labels)
+            loss = gen_cls_loss / accumulate_grad_batches
+            loss.backward()
+            
+            # 在累积周期结束时更新参数
+            if (step_count + 1) % accumulate_grad_batches == 0:
+                clip_grad_norm_(model.generation_validator.parameters(), max_norm=1.0)
+                optimizer.step()
+        
+        # 统计信息
+        gen_preds = torch.argmax(gen_logits, dim=1)
+        total_correct += (gen_preds == labels).sum().item()
+        total_samples += batch_size
+        total_loss += (loss.item() * accumulate_grad_batches) * batch_size
+        step_count += 1
+    
+    # 处理最后的不完整累积批次
+    if step_count % accumulate_grad_batches != 0:
+        if use_mixed_precision and scaler is not None and AMP_AVAILABLE:
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.generation_validator.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            clip_grad_norm_(model.generation_validator.parameters(), max_norm=1.0)
+            optimizer.step()
+    
+    n = len(dataloader.dataset)
+    acc = total_correct / total_samples if total_samples > 0 else 0.0
+    
+    # 恢复所有参数的梯度
+    for param in model.parameters():
+        param.requires_grad = True
+    
+    return total_loss / n, acc
 
 def parse_args():
     parser = argparse.ArgumentParser(description='V13 多模态时间序列模型训练 - 支持FM/OD/MEFAR混合训练')
@@ -1249,6 +1563,41 @@ def main():
             model, val_loader, criterion, device, [], need_indices=[], dataset=dataset
         )
         
+        # 验证生成分类器评估（如果启用）
+        gen_val_metrics = None
+        if config.get('enable_generation_validator', False):
+            gen_val_config = config.get('generation_validator_config', {})
+            eval_frequency = gen_val_config.get('eval_frequency', 5)
+            
+            if epoch % eval_frequency == 0:
+                logger.info(f"Epoch {epoch}: 开始验证生成分类器评估...")
+                gen_val_loss, gen_val_recon, gen_input_acc, gen_reconstructed_acc, gen_validator_acc = eval_with_generation_validator(
+                    model, val_loader, criterion, device, [], need_indices=[], dataset=dataset
+                )
+                
+                # 计算各种指标
+                gen_recon_vs_input = gen_reconstructed_acc - gen_input_acc
+                gen_validator_vs_input = gen_validator_acc - gen_input_acc
+                
+                # 记录验证生成分类器指标
+                logger.info(f"验证生成分类器结果:")
+                logger.info(f"  输入数据准确率: {gen_input_acc:.4f}")
+                logger.info(f"  重建数据准确率: {gen_reconstructed_acc:.4f}")
+                logger.info(f"  生成验证准确率: {gen_validator_acc:.4f}")
+                logger.info(f"  重建 vs 输入提升: {gen_recon_vs_input:+.4f}")
+                logger.info(f"  生成验证 vs 输入提升: {gen_validator_vs_input:+.4f}")
+                
+                # 将验证生成分类器指标存储为字典，方便后续使用
+                gen_val_metrics = {
+                    'loss': gen_val_loss,
+                    'recon_loss': gen_val_recon,
+                    'input_acc': gen_input_acc,
+                    'reconstructed_acc': gen_reconstructed_acc,
+                    'generated_acc': gen_validator_acc,
+                    'recon_vs_input': gen_recon_vs_input,
+                    'gen_vs_input': gen_validator_vs_input
+                }
+        
         # 学习率调度
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']
@@ -1292,6 +1641,16 @@ def main():
         writer.add_scalar('Val/Accuracy_Improvement', val_accuracy_improvement, epoch)  # 验证集准确率提升
         writer.add_scalar('Train/LR', current_lr, epoch)
         
+        # 记录验证生成分类器指标到TensorBoard（如果有）
+        if gen_val_metrics is not None:
+            writer.add_scalar('Val_GenValidator/Input_Acc', gen_val_metrics['input_acc'], epoch)
+            writer.add_scalar('Val_GenValidator/Reconstructed_Acc', gen_val_metrics['reconstructed_acc'], epoch)
+            writer.add_scalar('Val_GenValidator/Generated_Acc', gen_val_metrics['generated_acc'], epoch)
+            writer.add_scalar('Val_GenValidator/Recon_vs_Input', gen_val_metrics['recon_vs_input'], epoch)
+            writer.add_scalar('Val_GenValidator/Gen_vs_Input', gen_val_metrics['gen_vs_input'], epoch)
+            writer.add_scalar('Val_GenValidator/Loss', gen_val_metrics['loss'], epoch)
+            writer.add_scalar('Val_GenValidator/Recon_Loss', gen_val_metrics['recon_loss'], epoch)
+        
         # 保存最佳模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -1315,6 +1674,18 @@ def main():
                 'accuracy_improvement': accuracy_improvement,
                 'val_accuracy_improvement': val_accuracy_improvement
             }
+            
+            # 如果有验证生成分类器指标，也保存到检查点
+            if gen_val_metrics is not None:
+                checkpoint.update({
+                    'gen_val_input_acc': gen_val_metrics['input_acc'],
+                    'gen_val_reconstructed_acc': gen_val_metrics['reconstructed_acc'],
+                    'gen_val_generated_acc': gen_val_metrics['generated_acc'],
+                    'gen_val_recon_vs_input': gen_val_metrics['recon_vs_input'],
+                    'gen_val_gen_vs_input': gen_val_metrics['gen_vs_input'],
+                    'gen_val_loss': gen_val_metrics['loss'],
+                    'gen_val_recon_loss': gen_val_metrics['recon_loss']
+                })
             
             # 如果使用了混合精度训练，也保存scaler状态
             if scaler is not None:
@@ -1434,6 +1805,34 @@ def main():
     # 计算测试集的准确率提升
     test_accuracy_improvement = test_reconstructed_acc - test_input_acc
     
+    # 测试验证生成分类器性能（如果启用）
+    test_gen_val_metrics = None
+    if config.get('enable_generation_validator', False):
+        logger.info("开始测试集验证生成分类器评估...")
+        test_gen_val_loss, test_gen_val_recon, test_gen_input_acc, test_gen_reconstructed_acc, test_gen_validator_acc = eval_with_generation_validator(
+            model, test_loader, criterion, device, [], need_indices=[], dataset=dataset
+        )
+        
+        test_gen_recon_vs_input = test_gen_reconstructed_acc - test_gen_input_acc
+        test_gen_validator_vs_input = test_gen_validator_acc - test_gen_input_acc
+        
+        test_gen_val_metrics = {
+            'loss': test_gen_val_loss,
+            'recon_loss': test_gen_val_recon,
+            'input_acc': test_gen_input_acc,
+            'reconstructed_acc': test_gen_reconstructed_acc,
+            'generated_acc': test_gen_validator_acc,
+            'recon_vs_input': test_gen_recon_vs_input,
+            'gen_vs_input': test_gen_validator_vs_input
+        }
+        
+        logger.info(f"测试集验证生成分类器结果:")
+        logger.info(f"  输入数据准确率: {test_gen_input_acc:.4f}")
+        logger.info(f"  重建数据准确率: {test_gen_reconstructed_acc:.4f}")
+        logger.info(f"  生成验证准确率: {test_gen_validator_acc:.4f}")
+        logger.info(f"  重建 vs 输入提升: {test_gen_recon_vs_input:+.4f}")
+        logger.info(f"  生成验证 vs 输入提升: {test_gen_validator_vs_input:+.4f}")
+    
     logger.info(f"测试结果: loss={test_loss:.6f}, recon_loss={test_recon:.6f}")
     logger.info(f"测试集分类性能:")
     logger.info(f"  输入数据准确率 (Common真+Have真+Need当前值): {test_input_acc:.4f}")
@@ -1445,6 +1844,16 @@ def main():
     writer.add_scalar('Test/Input_Acc', test_input_acc)
     writer.add_scalar('Test/Reconstructed_Acc', test_reconstructed_acc)
     writer.add_scalar('Test/Accuracy_Improvement', test_accuracy_improvement)
+    
+    # 记录测试验证生成分类器指标到TensorBoard（如果有）
+    if test_gen_val_metrics is not None:
+        writer.add_scalar('Test_GenValidator/Input_Acc', test_gen_val_metrics['input_acc'])
+        writer.add_scalar('Test_GenValidator/Reconstructed_Acc', test_gen_val_metrics['reconstructed_acc'])
+        writer.add_scalar('Test_GenValidator/Generated_Acc', test_gen_val_metrics['generated_acc'])
+        writer.add_scalar('Test_GenValidator/Recon_vs_Input', test_gen_val_metrics['recon_vs_input'])
+        writer.add_scalar('Test_GenValidator/Gen_vs_Input', test_gen_val_metrics['gen_vs_input'])
+        writer.add_scalar('Test_GenValidator/Loss', test_gen_val_metrics['loss'])
+        writer.add_scalar('Test_GenValidator/Recon_Loss', test_gen_val_metrics['recon_loss'])
     
     writer.close()
     logger.info("训练完成！")
