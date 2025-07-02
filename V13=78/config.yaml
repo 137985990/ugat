@@ -6,6 +6,8 @@ data_files:
 block_col: block
 label_col: F  # 使用原始的大写F列
 
+resume_training: true
+
 # 标签配平配置
 label_balancing:
   enabled: true                # 是否启用标签配平
@@ -238,3 +240,4 @@ staged_training:
   # 阶段间模型加载策略
   load_best_reconstruction: true  # 阶段2是否加载阶段1的最佳模型
   load_best_classification: true  # 阶段3是否加载阶段2的最佳模型
+resume_training: true

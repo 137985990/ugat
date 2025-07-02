@@ -369,50 +369,6 @@ class SlidingWindowDataset(Dataset):
             if col in need_modalities:
                 mask[i] = 0  # need通道标记为0（需要补全）
         return mask
-    
-    def get_all_need_indices(self) -> List[int]:
-        """获取所有数据集的need通道索引的并集"""
-        all_need_indices = set()
-        
-        # 遍历所有可能的源数据集
-        for source_dataset in ['FM', 'OD', 'MEFAR']:
-            need_indices = self.get_need_indices_for_dataset(source_dataset)
-            all_need_indices.update(need_indices)
-        
-        return sorted(list(all_need_indices))
-    
-    def update_need_channels(self, need_predictions: List[Dict], need_indices: List[int]):
-        """
-        批量更新数据集中的need通道值
-        
-        Args:
-            need_predictions: 每个样本的need通道预测值列表
-            need_indices: need通道索引列表
-        """
-        if len(need_predictions) != len(self):
-            print(f"Warning: 预测数量({len(need_predictions)})与数据集大小({len(self)})不匹配")
-            return
-        
-        for idx, need_pred in enumerate(need_predictions):
-            if idx >= len(self.indices):
-                break
-                
-            b_idx, start, seg_label, source_dataset = self.indices[idx]
-            block = self.blocks[b_idx]
-            
-            # 更新对应窗口的need通道
-            for need_idx, pred_values in need_pred.items():
-                if need_idx in need_indices and need_idx < len(self.feature_cols):
-                    col_name = self.feature_cols[need_idx]
-                    # 更新block中对应时间窗口的数据
-                    end_idx = min(start + self.window_size, len(block))
-                    pred_len = min(len(pred_values), end_idx - start)
-                    
-                    # 将预测值写回到原始数据
-                    try:
-                        block.iloc[start:start+pred_len, block.columns.get_loc(col_name)] = pred_values[:pred_len].numpy()
-                    except Exception as e:
-                        print(f"更新need通道失败: {e}")
 
     def __len__(self):
         return len(self.indices)
@@ -508,55 +464,36 @@ class SlidingWindowDataset(Dataset):
         print(f"   - 预测结果数量: {len(all_need_predictions)}")
         print(f"   - need通道索引: {need_indices}")
         
-        # 如果没有need通道索引，直接返回
-        if not need_indices:
-            print("   - 没有need通道需要更新，跳过")
-            return
-        
         # 为了防止索引不匹配，我们按样本索引顺序更新
         updated_count = 0
-        error_count = 0
-        
         for sample_idx, need_pred in enumerate(all_need_predictions):
             if sample_idx < len(self.indices):
                 b_idx, start_idx, seg_label, source_dataset = self.indices[sample_idx]
                 
-                # 跳过空预测
-                if not need_pred:
-                    continue
+                # 获取对应的block
+                block = self.blocks[b_idx]
                 
-                try:
-                    # 获取对应的block
-                    block = self.blocks[b_idx]
-                    
-                    # 更新该窗口对应的数据行的need通道
-                    end_idx = start_idx + self.window_size
-                    
-                    for need_idx, pred_values in need_pred.items():
-                        if need_idx in need_indices and need_idx < len(self.feature_cols):
-                            feature_col = self.feature_cols[need_idx]
-                            if feature_col in block.columns:
-                                # 直接更新原始数据
-                                block_row_start = block.index[start_idx]
-                                block_row_end = block.index[min(end_idx, len(block)-1)]
-                                
-                                # 更新need通道值
-                                actual_length = min(len(pred_values), end_idx - start_idx)
-                                self.data.loc[block_row_start:block_row_start + actual_length - 1, feature_col] = pred_values[:actual_length].numpy()
-                                updated_count += 1
-                except Exception as e:
-                    print(f"   - 更新样本{sample_idx}时出错: {e}")
-                    error_count += 1
+                # 更新该窗口对应的数据行的need通道
+                end_idx = start_idx + self.window_size
+                
+                for need_idx, pred_values in need_pred.items():
+                    if need_idx < len(self.feature_cols):
+                        feature_col = self.feature_cols[need_idx]
+                        if feature_col in block.columns:
+                            # 直接更新原始数据
+                            block_row_start = block.index[start_idx]
+                            block_row_end = block.index[min(end_idx, len(block)-1)]
+                            
+                            # 更新need通道值
+                            self.data.loc[block_row_start:block_row_end, feature_col] = pred_values[:end_idx-start_idx].numpy()
+                            updated_count += 1
         
         # 重新更新blocks引用
-        try:
-            self.blocks = []
-            for block_id, block_df in self.data.groupby(self.block_col):
-                self.blocks.append(block_df)
-        except Exception as e:
-            print(f"   - 重新构建blocks时出错: {e}")
+        self.blocks = []
+        for block_id, block_df in self.data.groupby(self.block_col):
+            self.blocks.append(block_df)
         
-        print(f"Need通道更新完成，共更新了{updated_count}个样本窗口，{error_count}个错误")
+        print(f"Need通道更新完成，共更新了{updated_count}个样本窗口")
     
     def update_need(self, sample_idx: int, need_pred: Dict):
         """

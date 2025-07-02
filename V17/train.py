@@ -145,16 +145,10 @@ def check_label_distribution(dataset):
     print("所有标签:", sorted(list(all_labels)))
     return label_counter, all_labels
 
-def complete_need_with_model(model, dataset, device, need_indices=None):
+def complete_need_with_model(model, dataset, device, need_indices):
     """
     用模型对整个数据集的need通道进行补全，并写回dataset（循环补全逻辑）
     这是关键的循环学习机制：用当前模型补全need通道，为下一轮训练提供更好的数据
-    
-    Args:
-        model: 训练好的模型
-        dataset: 数据集
-        device: 设备
-        need_indices: 废弃参数，保持兼容性。实际Need通道根据source_dataset动态确定
     """
     model.eval()
     from torch.utils.data import DataLoader
@@ -165,125 +159,46 @@ def complete_need_with_model(model, dataset, device, need_indices=None):
     if hasattr(dataset, 'dataset'):
         original_dataset = dataset.dataset
     
-    # 使用自定义collate_fn来获取source_dataset信息
-    def collate_with_source(batch):
-        tensors, labels, indices_lists, is_real_masks, source_datasets = [], [], [], [], []
-        for item in batch:
-            tensor, label, indices_list, is_real_mask, source_dataset = item
-            tensors.append(tensor)
-            labels.append(label)
-            indices_lists.append(indices_list)
-            is_real_masks.append(is_real_mask)
-            source_datasets.append(source_dataset)
-        
-        batched_tensors = torch.stack(tensors)
-        batched_labels = torch.stack(labels)
-        batched_is_real_masks = torch.stack(is_real_masks)
-        
-        return batched_tensors, batched_labels, indices_lists, batched_is_real_masks, source_datasets
-    
-    loader = DataLoader(dataset, batch_size=32, shuffle=False, collate_fn=collate_with_source)
+    loader = DataLoader(dataset, batch_size=32, shuffle=False)
     all_need_predictions = []
     
-    print("开始基于source_dataset的循环补全need通道")
+    print(f"开始循环补全need通道 (共{len(need_indices)}个need通道)")
     
     with torch.no_grad():
-        global_idx = 0  # 全局样本索引
-        for batch_idx, batch_data in enumerate(tqdm(loader, desc="补全need通道")):
-            if len(batch_data) == 5:
-                batch_x, _, _, _, source_datasets = batch_data
+        for batch_idx, batch in enumerate(tqdm(loader, desc="补全need通道")):
+            if len(batch) == 4:
+                batch_x, _, _, _ = batch
             else:
-                # fallback to first element if format is unexpected
-                batch_x = batch_data[0]
-                source_datasets = ['UNKNOWN'] * batch_x.size(0)
+                batch_x = batch[0]
             
             batch_x = batch_x.to(device)
             batch_size, C, T = batch_x.size()
             
             # 对batch中每个样本进行need通道补全
             for i in range(batch_size):
-                src = source_datasets[i] if i < len(source_datasets) else 'UNKNOWN'
+                window = batch_x[i].t()  # [T, C]
+                out, _ = model(window)   # 模型重建输出 [C, T]
+                out = out.t()           # 转回 [T, C]
                 
-                # 根据source_dataset动态获取该样本的Need通道
-                sample_need_indices = original_dataset.get_need_indices_for_dataset(src) if hasattr(original_dataset, 'get_need_indices_for_dataset') else []
+                # 只保存need通道的预测结果
+                need_pred = {}
+                for need_idx in need_indices:
+                    if need_idx < out.size(1):
+                        need_pred[need_idx] = out[:, need_idx].cpu()
                 
-                # 调试信息
-                if batch_idx == 0 and i < 3:  # 只打印前几个样本的调试信息
-                    print(f"  样本 {global_idx}: source={src}, need_indices={sample_need_indices}")
-                
-                if sample_need_indices:  # 只有当该数据集有Need通道时才处理
-                    window = batch_x[i].t()  # [T, C]
-                    out, _ = model(window)   # 模型重建输出 [C, T]
-                    out = out.t()           # 转回 [T, C]
-                    
-                    # 只保存该样本的need通道预测结果
-                    need_pred = {}
-                    for need_idx in sample_need_indices:
-                        if need_idx < out.size(1):
-                            need_pred[need_idx] = out[:, need_idx].cpu()
-                    
-                    all_need_predictions.append((global_idx, need_pred, src))
-                else:
-                    # 该数据集没有Need通道，跳过
-                    all_need_predictions.append((global_idx, {}, src))
-                
-                global_idx += 1
+                all_need_predictions.append(need_pred)
     
     # 将预测的need通道写回原始数据集
-    if hasattr(original_dataset, 'update_need_channels_by_source'):
-        # 如果数据集支持按source批量更新need通道
-        original_dataset.update_need_channels_by_source(all_need_predictions)
-    elif hasattr(original_dataset, 'update_need_channels'):
-        # 兼容旧接口 - 但需要正确处理need_indices
-        print("开始批量更新need通道...")
-        print(f"   - 预测结果数量: {len(all_need_predictions)}")
-        
-        # 收集所有实际使用的need通道索引
-        all_used_need_indices = set()
-        valid_predictions = []
-        
-        for global_idx, need_pred, src in all_need_predictions:
-            if need_pred:  # 只处理非空的预测
-                all_used_need_indices.update(need_pred.keys())
-                valid_predictions.append((global_idx, need_pred, src))
-        
-        all_used_need_indices = sorted(list(all_used_need_indices))
-        print(f"   - 实际使用的need通道索引: {all_used_need_indices}")
-        print(f"   - 有效预测数量: {len(valid_predictions)}")
-        
-        if all_used_need_indices and valid_predictions:
-            # 转换为旧格式：需要为所有样本（包括没有need通道的）构建预测结果
-            need_preds_for_old_api = []
-            valid_pred_map = {idx: pred for idx, pred, _ in valid_predictions}
-            
-            for global_idx, _, _ in all_need_predictions:
-                if global_idx in valid_pred_map:
-                    # 有预测结果的样本
-                    need_pred = valid_pred_map[global_idx]
-                    old_format_pred = {}
-                    for need_idx in all_used_need_indices:
-                        if need_idx in need_pred:
-                            old_format_pred[need_idx] = need_pred[need_idx]
-                    need_preds_for_old_api.append(old_format_pred)
-                else:
-                    # 没有预测结果的样本，添加空字典
-                    need_preds_for_old_api.append({})
-            
-            # 调用旧接口，传入正确的need_indices
-            original_dataset.update_need_channels(need_preds_for_old_api, all_used_need_indices)
-        else:
-            print("   - 没有有效的need通道预测，跳过更新")
+    if hasattr(original_dataset, 'update_need_channels'):
+        # 如果数据集支持批量更新need通道
+        original_dataset.update_need_channels(all_need_predictions, need_indices)
     else:
         # 逐个更新（fallback方案）
-        updated_count = 0
-        for global_idx, need_pred, src in all_need_predictions:
-            if need_pred and hasattr(original_dataset, 'update_need'):
-                original_dataset.update_need(global_idx, need_pred)
-                updated_count += 1
-        print(f"   - 通过fallback方案更新了{updated_count}个样本")
+        for idx, need_pred in enumerate(all_need_predictions):
+            if hasattr(original_dataset, 'update_need'):
+                original_dataset.update_need(idx, need_pred)
     
-    total_updated = sum(1 for _, pred, _ in all_need_predictions if pred)
-    print(f"循环补全完成，已更新{total_updated}个样本的need通道（根据source_dataset动态确定）")
+    print(f"循环补全完成，已更新{len(all_need_predictions)}个样本的need通道")
 
 def mask_channel(batch, source_datasets, dataset):
     """对batch中的每个样本按其source_dataset动态遮掩have通道"""
@@ -305,7 +220,7 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                                       training_strategy="mask_have", common_indices=None, have_indices=None, 
                                       recon_weight=1.0, cls_improvement_weight=1.0, dataset=None, current_epoch=1,
                                       loss_config=None):
-    """训练函数 - 实现双路径分类训练，优化重建数据的分类性能（V13方式）"""
+    """训练函数 - 实现双路径分类训练，优化重建数据的分类性能"""
     model.train()
     
     # 从loss_config获取参数
@@ -383,25 +298,18 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                                                     common_indices, criterion, C, batch_size, need_indices,
                                                     training_strategy, have_indices, source_datasets, dataset, current_epoch)
                 
-                # 阶段2: 双路径分类训练 - 使用UNet内置分类器（V13方式）
-                # 路径1: 输入数据分类 (Common真+Have真+Need初始/上轮生成) → UNet分类器 → 基准性能
+                # 阶段2: 双路径分类训练 - 每轮都比上轮更好的循环改进
+                # 路径1: 输入数据分类 (Common真+Have真+Need初始/上轮生成) → 分类器 → 基准性能
                 # 注意：输入batch本身就包含了当前的Need值（0或上轮生成的结果）
                 _, input_logits = forward_batch_parallel(model, batch, device)
                 
-                # 路径2: 重建数据分类 (Common真+Have真+Need当前生成) → UNet分类器 → 目标性能
+                # 路径2: 重建数据分类 (Common真+Have真+Need当前生成) → 分类器 → 目标性能
                 # 构建增强数据：保留Common+Have，用当前模型生成的Need替换
-                # 关键：根据每个样本的source_dataset动态确定Need通道
                 enhanced_data = batch.clone()
-                
-                # 逐样本处理，根据source_dataset动态确定Need通道
-                for i in range(batch_size):
-                    src = source_datasets[i] if i < len(source_datasets) else 'UNKNOWN'
-                    sample_need_indices = dataset.get_need_indices_for_dataset(src) if dataset is not None else []
-                    
-                    # 用重建结果替换该样本的Need通道
-                    for need_idx in sample_need_indices:
+                if need_indices:
+                    for need_idx in need_indices:
                         if need_idx < batch_reconstructed.size(1):
-                            enhanced_data[i, need_idx, :] = batch_reconstructed[i, need_idx, :]
+                            enhanced_data[:, need_idx, :] = batch_reconstructed[:, need_idx, :]
                 
                 _, enhanced_logits = forward_batch_parallel(model, enhanced_data, device)
                 
@@ -464,7 +372,6 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
             # 在累积周期结束时更新参数
             if (step_count + 1) % accumulate_grad_batches == 0:
                 scaler.unscale_(optimizer)
-                # 对UNet模型参数进行梯度裁剪（V13方式）
                 clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -476,24 +383,16 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
                                                 common_indices, criterion, C, batch_size, need_indices,
                                                 training_strategy, have_indices, source_datasets, dataset, current_epoch)
             
-            # 阶段2: 双路径分类训练 - 使用UNet内置分类器（V13方式）
-            # 路径1: 输入数据分类 (Common真+Have真+Need初始/上轮生成) → UNet分类器 → 基准性能
+            # 阶段2: 双路径分类训练 - 每轮都比上轮更好的循环改进
+            # 路径1: 输入数据分类 (Common真+Have真+Need初始/上轮生成) → 分类器 → 基准性能
             _, input_logits = forward_batch_parallel(model, batch, device)
             
-            # 路径2: 重建数据分类 (Common真+Have真+Need当前生成) → UNet分类器 → 目标性能
-            # 构建增强数据：保留Common+Have，用当前模型生成的Need替换  
-            # 关键：根据每个样本的source_dataset动态确定Need通道
+            # 路径2: 重建数据分类 (Common真+Have真+Need当前生成) → 分类器 → 目标性能
             enhanced_data = batch.clone()
-            
-            # 逐样本处理，根据source_dataset动态确定Need通道
-            for i in range(batch_size):
-                src = source_datasets[i] if i < len(source_datasets) else 'UNKNOWN'
-                sample_need_indices = dataset.get_need_indices_for_dataset(src) if dataset is not None else []
-                
-                # 用重建结果替换该样本的Need通道
-                for need_idx in sample_need_indices:
+            if need_indices:
+                for need_idx in need_indices:
                     if need_idx < batch_reconstructed.size(1):
-                        enhanced_data[i, need_idx, :] = batch_reconstructed[i, need_idx, :]
+                        enhanced_data[:, need_idx, :] = batch_reconstructed[:, need_idx, :]
             
             _, enhanced_logits = forward_batch_parallel(model, enhanced_data, device)
             
@@ -551,7 +450,6 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
             
             # 在累积周期结束时更新参数
             if (step_count + 1) % accumulate_grad_batches == 0:
-                # 对UNet模型参数进行梯度裁剪（V13方式）
                 clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
         
@@ -613,12 +511,10 @@ def train_phased_with_grad_accumulation(model, dataloader, optimizer, criterion,
     if step_count % accumulate_grad_batches != 0:
         if use_mixed_precision and scaler is not None and AMP_AVAILABLE:
             scaler.unscale_(optimizer)
-            # 对UNet模型参数进行梯度裁剪（V13方式）
             clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            # 对UNet模型参数进行梯度裁剪（V13方式）
             clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
     
@@ -934,7 +830,7 @@ def compute_batch_recon_loss(targets, predictions, is_real_mask, common_indices,
 
 def eval_loop(model, dataloader, criterion, device, mask_indices, need_indices=None, dataset=None):
     """
-    评估函数 - 计算重建损失和双路径分类准确率（V13方式）
+    评估函数 - 计算重建损失和双路径分类准确率
     
     Returns:
         tuple: (total_loss, total_recon_loss, input_acc, reconstructed_acc)
@@ -974,30 +870,22 @@ def eval_loop(model, dataloader, criterion, device, mask_indices, need_indices=N
             batch_reconstructed, _ = forward_batch_parallel(model, masked, device)
             
             # 构建输入数据用于分类 (Common真+Have真+Need=0)
-            # 根据每个样本的source_dataset动态确定Need通道并设为0
+            # 将Need通道设置为0，模拟没有Need信息的情况
             input_data = batch.clone()
-            for i in range(batch_size):
-                src = source_datasets[i] if i < len(source_datasets) else 'UNKNOWN'
-                sample_need_indices = dataset.get_need_indices_for_dataset(src) if dataset is not None else []
-                
-                # 将该样本的Need通道设为0，模拟没有Need信息的情况
-                for need_idx in sample_need_indices:
+            if need_indices:
+                for need_idx in need_indices:
                     if need_idx < input_data.size(1):
-                        input_data[i, need_idx, :] = 0
+                        input_data[:, need_idx, :] = 0
             
             # 构建重建数据用于分类 (Common真+Have真+Need生成)
-            # 根据每个样本的source_dataset动态确定Need通道并用生成值替换
+            # 保留Common+Have，用生成的Need替换
             enhanced_data = batch.clone()
-            for i in range(batch_size):
-                src = source_datasets[i] if i < len(source_datasets) else 'UNKNOWN'
-                sample_need_indices = dataset.get_need_indices_for_dataset(src) if dataset is not None else []
-                
-                # 用重建结果替换该样本的Need通道
-                for need_idx in sample_need_indices:
+            if need_indices:
+                for need_idx in need_indices:
                     if need_idx < batch_reconstructed.size(1):
-                        enhanced_data[i, need_idx, :] = batch_reconstructed[i, need_idx, :]
+                        enhanced_data[:, need_idx, :] = batch_reconstructed[:, need_idx, :]
             
-            # 分类评估 - 使用UNet内置分类器（V13方式）
+            # 分类评估
             _, input_logits = forward_batch_parallel(model, input_data, device)
             _, enhanced_logits = forward_batch_parallel(model, enhanced_data, device)
             
@@ -1158,20 +1046,15 @@ def main():
             input_channels = config.get('input_channels', 32)
             logger.info(f"使用默认输入通道数: {input_channels}")
     from model import TGATUNet
-    
-    # 创建主生成模型（TGATUNet）
     model = TGATUNet(
         in_channels=input_channels,
         hidden_channels=config.get('hidden_channels', 64),
         out_channels=input_channels,
         num_classes=config.get('num_classes', 2)
     ).to(device)
-    logger.info(f"主生成模型创建完成，参数量: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(f"模型创建完成，参数量: {sum(p.numel() for p in model.parameters()):,}")
 
-    # V16按照V13方式：使用UNet内置分类器，不创建独立分类器
-    # 合并UNet模型参数进行优化
-    all_parameters = list(model.parameters())
-    optimizer = Adam(all_parameters, lr=config.get('learning_rate', 1e-4), weight_decay=config.get('weight_decay', 1e-5))
+    optimizer = Adam(model.parameters(), lr=config.get('learning_rate', 1e-4), weight_decay=config.get('weight_decay', 1e-5))
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=config.get('lr_factor', 0.5), patience=config.get('lr_patience', 10), verbose=True)
     scaler = GradScaler() if AMP_AVAILABLE and config.get('use_amp', False) else None
     writer = SummaryWriter(config.get('tensorboard_dir', 'runs'))
@@ -1294,7 +1177,7 @@ def main():
             best_val_loss = val_loss
             patience_counter = 0
             
-            # 构建完整的检查点信息（V13方式：只保存UNet模型）
+            # 构建完整的检查点信息
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
@@ -1353,21 +1236,6 @@ def main():
             torch.save(periodic_checkpoint, periodic_path)
             logger.info(f"周期性保存检查点到: {periodic_path}")
             
-        # 🔥 循环学习核心机制：每个epoch结束后用当前模型更新数据集的Need通道
-        if epoch % config.get('need_update_interval', 1) == 0:  # 每N个epoch更新一次Need通道
-            logger.info(f"开始第 {epoch} 轮循环更新Need通道...")
-            
-            # 用当前模型对训练数据集进行Need通道补全（动态根据source_dataset确定Need通道）
-            logger.info("更新训练数据集的Need通道（根据source_dataset动态确定）")
-            complete_need_with_model(model, train_dataset, device)
-            
-            # 同样更新验证数据集的Need通道（可选，但建议更新以保持一致性）
-            if config.get('update_val_need', True):
-                logger.info("更新验证数据集的Need通道（根据source_dataset动态确定）")
-                complete_need_with_model(model, val_dataset, device)
-            
-            logger.info(f"第 {epoch} 轮Need通道更新完成")
-        
         # 早停检查
         if patience_counter >= patience:
             logger.info(f"早停触发，在第 {epoch} 轮停止训练")
@@ -1387,8 +1255,6 @@ def main():
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             # 这是完整的检查点格式
             model.load_state_dict(checkpoint['model_state_dict'])
-            logger.info("成功加载模型状态")
-            
             logger.info(f"从完整检查点加载模型 (epoch {checkpoint.get('epoch', 'unknown')})")
             logger.info(f"最佳验证损失: {checkpoint.get('best_val_loss', 'unknown')}")
             
@@ -1403,7 +1269,6 @@ def main():
             # 这是旧格式的state_dict
             model.load_state_dict(checkpoint)
             logger.info("从旧格式检查点加载模型")
-            logger.warning("旧格式检查点不包含分类器，使用随机初始化的分类器")
             
     except Exception as e:
         logger.warning(f"加载完整检查点失败: {e}")
