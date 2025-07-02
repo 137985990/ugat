@@ -938,8 +938,10 @@ def eval_loop(model, dataloader, criterion, device, mask_indices, need_indices=N
     
     Returns:
         tuple: (total_loss, total_recon_loss, input_acc, reconstructed_acc)
-               其中 input_acc 是输入数据准确率 (Common真+Have真+Need=0)
-               reconstructed_acc 是重建数据准确率 (Common真+Have真+Need生成)
+               其中 input_acc 是输入数据准确率 (Common真+Have真+Need当前值)
+               reconstructed_acc 是重建数据准确率 (Common真+Have真+Need生成值)
+               
+    注意：Need通道使用当前数据集中的值（循环更新后的值），确保与训练时一致
     """
     model.eval()
     total_loss = 0.0
@@ -973,17 +975,10 @@ def eval_loop(model, dataloader, criterion, device, mask_indices, need_indices=N
             # 批量处理重建和分类
             batch_reconstructed, _ = forward_batch_parallel(model, masked, device)
             
-            # 构建输入数据用于分类 (Common真+Have真+Need=0)
-            # 根据每个样本的source_dataset动态确定Need通道并设为0
-            input_data = batch.clone()
-            for i in range(batch_size):
-                src = source_datasets[i] if i < len(source_datasets) else 'UNKNOWN'
-                sample_need_indices = dataset.get_need_indices_for_dataset(src) if dataset is not None else []
-                
-                # 将该样本的Need通道设为0，模拟没有Need信息的情况
-                for need_idx in sample_need_indices:
-                    if need_idx < input_data.size(1):
-                        input_data[i, need_idx, :] = 0
+            # 构建输入数据用于分类 (Common真+Have真+Need当前值)
+            # 注意：Need通道使用当前数据集中的值（可能是0或循环更新后的值）
+            # 这确保了验证/测试与训练时的一致性
+            input_data = batch.clone()  # 直接使用当前batch，包含循环更新后的Need值
             
             # 构建重建数据用于分类 (Common真+Have真+Need生成)
             # 根据每个样本的source_dataset动态确定Need通道并用生成值替换
@@ -1230,6 +1225,10 @@ def main():
     logger.info("目标: 每轮训练都让路径2的分类效果比路径1更好，实现Need通道的循序渐进补全")
     logger.info("=====================")
     for epoch in range(start_epoch, epochs + 1):
+        # 在每个epoch开始前，用当前模型对训练集进行Need通道循环补全
+        logger.info(f"Epoch {epoch}: 开始训练集Need通道循环补全...")
+        complete_need_with_model(model, train_dataset, device)
+        
         train_loss, train_recon, train_cls_improvement, train_input_acc, train_reconstructed_acc, _ = train_phased_with_grad_accumulation(
             model, train_loader, optimizer, criterion, device, [],
             accumulate_grad_batches=config.get('accumulate_grad_batches', 2),
@@ -1240,6 +1239,10 @@ def main():
             cls_improvement_weight=config.get('loss_config', {}).get('cls_improvement_weight', 2.0),
             dataset=dataset, current_epoch=epoch, loss_config=config.get('loss_config', {})
         )
+        
+        # 在验证前，也用当前模型对验证集进行Need通道更新，确保一致性
+        logger.info(f"Epoch {epoch}: 开始验证集Need通道更新...")
+        complete_need_with_model(model, val_dataset, device)
         
         # 验证阶段
         val_loss, val_recon, val_input_acc, val_reconstructed_acc = eval_loop(
@@ -1420,6 +1423,10 @@ def main():
             logger.error(f"加载仅权重文件也失败: {e2}")
             raise
     
+    # 在测试前，用最佳模型对测试集进行Need通道更新
+    logger.info("开始测试集Need通道更新...")
+    complete_need_with_model(model, test_dataset, device)
+    
     test_loss, test_recon, test_input_acc, test_reconstructed_acc = eval_loop(
         model, test_loader, criterion, device, [], need_indices=[], dataset=dataset
     )
@@ -1429,8 +1436,8 @@ def main():
     
     logger.info(f"测试结果: loss={test_loss:.6f}, recon_loss={test_recon:.6f}")
     logger.info(f"测试集分类性能:")
-    logger.info(f"  输入数据准确率 (Common真+Have真+Need=0): {test_input_acc:.4f}")
-    logger.info(f"  重建数据准确率 (Common真+Have真+Need生成): {test_reconstructed_acc:.4f}")
+    logger.info(f"  输入数据准确率 (Common真+Have真+Need当前值): {test_input_acc:.4f}")
+    logger.info(f"  重建数据准确率 (Common真+Have真+Need生成值): {test_reconstructed_acc:.4f}")
     logger.info(f"  准确率提升: {test_accuracy_improvement:+.4f}")
       # 记录测试结果到TensorBoard
     writer.add_scalar('Test/Loss', test_loss)
